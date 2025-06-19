@@ -1,0 +1,1990 @@
+---
+title: "02-19"
+output: pdf_document
+date: "2025-02-20"
+---
+
+```{r}
+library(dplyr)
+library(data.table)
+library(survey)
+library(gtsummary)
+library(gt)
+library(ggplot2)
+library(srvyr)
+library(patchwork)
+library(officer)
+library(doParallel)
+library(foreach)
+library(haven)
+library(tidyr)
+```
+
+# Final inclusion criteria
+```{r}
+all2 <- readRDS("/Users/miaomiao/Desktop/Vincent/all2.rds")
+#cohort
+#2001-2002 - 2021-2023 (2017-2020)
+all3 <- all2 %>% filter(cycle!=1)
+
+#glucose calibrate
+all3[, GLUC_calibrated := GLUC]
+# before 2005-2006 to 2005-2006
+all3[cycle <= 3, GLUC_calibrated := 0.9815 * GLUC_calibrated + 3.5707]
+# before 2007-2008 to 2007-2008
+all3[cycle <= 4, GLUC_calibrated := GLUC_calibrated + 1.148]
+# before 2015-2016 to 2015-2016
+all3[cycle <= 8, GLUC_calibrated := 1.023 * GLUC_calibrated - 0.5108]
+# 
+all3[cycle > 8 & cycle <= 66, GLUC_calibrated := GLUC]
+
+
+#Adults (≥ 18 years old)
+#Non-missing DM.doc status
+#Non-missing fasting glucose
+#Non-missing hemoglobin A1c
+#cohort
+#-missing value report
+missing_value_report <- all3 %>% 
+  summarise(missing_HBA1C = sum(is.na(HBA1C)),
+            missing_GLU = sum(is.na(GLUC_calibrated)),
+            missing_DM.doc = sum(is.na(DM.doc)),
+            age_under18 = sum(age<18))
+print(missing_value_report)
+#-Non-missing fasting glucose, HBA1C
+#-Non-missing DM.doc survey
+
+all3 <- all3 %>% filter(!is.na(HBA1C) & !is.na(GLUC_calibrated) & !is.na(DM.doc))
+setDT(all3)
+
+#create new weights
+all3 <- all3[, `:=`(
+  weight.full = ifelse(cycle == 66, (3.2 / 21.2) * WTINTPRP, WTINT2YR * 2 / 21.2),
+  weight.mec = ifelse(cycle == 66, (3.2 / 21.2) * WTMECPRP, WTMEC2YR * 2 / 21.2),
+  weight.fasting = ifelse(cycle == 66, (3.2 / 21.2) * WTSAFPRP, WTSAF2YR * 2 / 21.2),
+  weight.lab = ifelse(cycle == 66, (3.2 / 21.2) * WTSA2YR, WTSA2YR * 2 / 21.2)
+)]
+
+all3 <- all3 %>% 
+  mutate(DM.insulin = as.factor(DM.insulin),
+         DM.pills = as.factor(DM.pills))
+all3 <- all3 %>%
+  mutate(
+    cycle_label = case_when(
+      cycle == 2 ~ "2001-2002",
+      cycle == 3 ~ "2003-2004",
+      cycle == 4 ~ "2005-2006",
+      cycle == 5 ~ "2007-2008",
+      cycle == 6 ~ "2009-2010",
+      cycle == 7 ~ "2011-2012",
+      cycle == 8 ~ "2013-2014",
+      cycle == 9 ~ "2015-2016",
+      cycle == 66 ~ "2017-2020",
+      cycle == 12 ~ "2021-2023"
+    ),
+    DM.doc = ifelse(DM.doc==2| DM.doc==3, 0, DM.doc) #1 YES, 2 NO 3, borderline, merge borderline to No
+    
+  )
+
+all3[, DM.all:=ifelse(DM.doc==1 | GLUC_calibrated >= 126 | HBA1C >= 6.5, 1, 0)]
+all3[, DM.undx:=ifelse((DM.doc!=1 | is.na(DM.doc)) & ( GLUC_calibrated >= 126 | HBA1C >= 6.5), 1, 0)]
+table(all3$DM.all) #5069
+table(all3$DM.undx) #1602
+table(all3$DM.doc) #3467
+
+all3 <- all3 %>%
+  mutate(cycle_label_numeric = as.numeric(as.factor(cycle_label)))
+
+all3[, DM.status:=fcase(
+  DM.all!=1 , "No Diabetes",
+  DM.doc==1 , "DM.doc",
+  DM.undx==1 , "DM.undx"
+)]
+table(all3$DM.status)
+```
+
+# add ids, strata, Ratio of family income to poverty vars
+```{r}
+num_cores <- detectCores()
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+file_names <- paste0("demo_", LETTERS[1:12], ".xpt")
+file_paths <- file.path("/Users/miaomiao/Desktop/vincent", file_names)
+common_vars <- c("SEQN","SDMVPSU", "SDMVSTRA","INDFMPIR")
+
+demo_combined2 <- foreach(file = file_paths, .combine = bind_rows, .packages = c("haven", "dplyr")) %dopar% {
+  demo <- read_xpt(file) %>%
+    select(all_of(common_vars))
+ 
+} 
+stopCluster(cl)
+
+
+saveRDS(demo_combined2, "/Users/miaomiao/Desktop/vincent/demo_combined2.rds")
+
+#link the variables to all3
+all3 <- all3 %>% inner_join(demo_combined2, by = "SEQN")
+all3 <- all3 %>% rename(PIR = INDFMPIR)
+
+#<1, 1-<2, >= 2
+all3 <- all3 %>% 
+  mutate(PIR_cate = case_when(
+    PIR < 1 ~ "low PIR",
+    1<= PIR & PIR < 2 ~ "medium PIR",
+    PIR>=2 ~ "high PIR"
+  ))
+```
+
+#add and combine HIQ (Health Insurance Questionnaire)
+If private is true, then regardless of other values, list as “priv”
+Otherwise, if medicare is true, list as “care”
+Otherwise, if medicaid is true, list as “caid”
+Otherwise, it’s “other” 
+```{r}
+num_cores <- detectCores()
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+file_names <- paste0("HIQ_", LETTERS[1:11], ".xpt")
+file_paths <- file.path("/Users/miaomiao/Desktop/vincent", file_names)
+
+
+hiq_combined <- foreach(file = file_paths, .combine = bind_rows, .packages = c("haven", "dplyr")) %dopar% {
+   if (grepl("HIQ_[A-C]", file)) {
+    hiq <- read_xpt(file) %>%
+    select(SEQN, HID010, matches("^HID030[A-E]")) 
+  } else if (grepl("HIQ_[D-I]", file)) {
+    hiq <- read_xpt(file) %>%
+    select(SEQN, HIQ011, matches("^HIQ031[A-J]")) 
+  } else if (grepl("HIQ_[J-K]", file)) {
+    hiq <- read_xpt(file) %>%
+    select(SEQN, HIQ011, matches("^HIQ032[A-J]")) 
+  } 
+} 
+stopCluster(cl)
+
+
+hiq_combined <- all3 %>% 
+  select(SEQN, cycle) %>% 
+  inner_join(hiq_combined, by = "SEQN")
+
+hiq_combined <- hiq_combined %>% 
+  mutate(Insured = case_when(
+    (cycle <= 3 & HID010 == 1)|(cycle>3 & HIQ011 == 1) ~ "Yes",
+    (cycle <= 3 & HID010 == 2)|(cycle>3 & HIQ011 == 2) ~ "No",
+    TRUE ~ NA
+    ))
+
+hiq_combined <- hiq_combined %>% 
+  mutate(HID030A = case_when(
+      cycle <= 3 ~ HID030A,
+      cycle > 3 & cycle <=9 & (HIQ031A == 14 | HIQ031C == 16) ~ 1,
+      cycle > 9 & (HIQ032A == 1 | HIQ032C == 3) ~ 1,
+      TRUE ~ NA
+    ),
+    HID030B = case_when(
+      cycle <= 3 ~ HID030B,
+      cycle > 3 & cycle <=9 & HIQ031B == 15 ~ 1,
+      cycle > 9 & HIQ032B == 2 ~ 1,
+      TRUE ~ NA
+    ),
+    HID030C = case_when(
+      cycle <= 3 ~ HID030C,
+      cycle > 3 & cycle <=9 & (HIQ031D == 17 | HIQ031E == 18) ~ 1,
+      cycle > 9 & (HIQ032D == 4 | HIQ032E == 5) ~ 1,
+      TRUE ~ NA
+    ),
+    
+    HID030D = case_when(
+      cycle <= 3 ~ HID030D,
+      cycle > 3 & cycle <=9 & (HIQ031F == 19 | HIQ031G == 20 | HIQ031H == 21 | HIQ031I == 22) ~ 1,
+      cycle > 9 & (HIQ032H == 8 | HIQ032I == 9) ~ 1,
+      TRUE ~ NA
+    ),
+    
+    HID030E = case_when(
+      cycle <= 3 ~ HID030E,
+      cycle > 3 & cycle <=9 & HIQ031J == 23 ~ 1,
+      TRUE ~ NA
+    ))
+
+hiq_combined <- hiq_combined %>% 
+  mutate(
+    Insurance_status = case_when(
+      HID030A == 1  ~ "PRIV",
+      HID030B == 1  ~ "CARE",
+      HID030C == 1  ~ "CAID",
+      (HID030D == 1 | HID030E == 1)  ~ "OTHER",
+      TRUE ~ NA_character_
+    ),
+    Insured = ifelse(HID030E == 1 & Insured=="yes", "No", Insured),
+  ) 
+saveRDS(hiq_combined, "/Users/miaomiao/Desktop/vincent/hiq_combined.rds")
+hiq_combined <- readRDS("/Users/miaomiao/Desktop/vincent/hiq_combined.rds")
+
+all3 <-  hiq_combined %>% select(SEQN, Insured, Insurance_status) %>% 
+  inner_join(all3, by = "SEQN")
+
+
+```
+
+
+
+# check for age
+```{r}
+#demo_combined <- readRDS("/Users/miaomiao/Desktop/vincent/demo_combined.rds")
+#summary(demo_combined$RIDAGEYR)
+#summary(all3$age)
+```
+
+#create new income2 category
+```{r}
+all3$income2 <- factor(
+  ifelse(all3$income %in% c("0 to $9,999", "$10,000 to $14,999", "$15,000 to $19,999", "$20,000 to $24,999"), "0-$24,999",
+  ifelse(all3$income %in% c("$25,000 to $34,999", "$35,000 to $44,999", "$45,000 to $54,999"), "$25,000-$54,999",
+  ifelse(all3$income %in% c("$55,000 to $64,999", "$65,000 to $74,999"), "$55,000-$74,999",
+  ifelse(all3$income %in% ("$75,000 and Over"), "$75,000 and Over", NA)))), 
+  levels = c("0-$24,999", "$25,000-$54,999", "$55,000-$74,999", "$75,000 and Over")
+)
+```
+
+
+
+#Table 1. Clinical Characteristics of Diagnosed Diabetes and Undiagnosed Diabetes in US Adults, 2017-2023
+```{r}
+#restrict to 2017-2023
+all3_6612 <- all3 %>% filter(cycle==66 | cycle==12)
+all3_6612 <- all3_6612 %>% filter(age2 != "85+")
+all3_6612$age2 <- droplevels(all3_6612$age2)
+
+# Define survey design 
+svy_design_t1 <- svydesign(
+  ids = ~SDMVPSU,    
+  strata = ~SDMVSTRA,  
+  weights = ~weight.fasting,  
+  data = all3_6612,  
+  nest = TRUE
+)
+
+vars <- c("age2", "sex", "education", "ridreth3", "birthcountry", "income2", "smoking.status", "Insured", "Insurance_status","PIR_cate", "GLUC_calibrated", "HBA1C", "BMXBMI", "BMXWAIST", "LDL", "HDL", "TG", "BPXSAR", "BPXDAR", "AST", "ALT")
+
+
+
+# summary table with raw counts, weighted percentages, and weighted p-values
+tbl1 <- tbl_svysummary(
+  svy_design_t1,   
+  by = DM.status,  
+  include = all_of(vars),  
+  missing = "no",    
+  type = list(
+    age2 ~ "categorical",
+    sex ~ "categorical",
+    education ~ "categorical",
+    ridreth3 ~ "categorical",
+    birthcountry ~ "categorical",
+    income2 ~ "categorical",
+    smoking.status ~ "categorical",
+    Insured ~ "categorical",
+    Insurance_status ~ "categorical",
+    PIR_cate ~ "categorical",
+    GLUC_calibrated ~ "continuous",
+    HBA1C ~ "continuous",
+    BMXBMI ~ "continuous",
+    BMXWAIST ~ "continuous",
+    LDL ~ "continuous",
+    HDL ~ "continuous",
+    TG ~ "continuous",
+    BPXSAR ~ "continuous",
+    BPXDAR ~ "continuous",
+    AST ~ "continuous",
+    ALT ~ "continuous"
+  ),
+  statistic = list(
+    all_categorical() ~ "{n_unweighted} ({p}%)",  # Raw count and weighted %
+    all_continuous() ~ "{median} ({p25}, {p75})"  # Median and IQR for continuous
+  )
+) %>%
+  add_n(statistic = "{N_nonmiss_unweighted}") %>%
+  add_p(
+    test = list(
+      age2 ~ svychisq,
+      sex ~ svychisq,            
+      education ~ svychisq,
+      ridreth3 ~ svychisq,
+      birthcountry ~ svychisq,
+      income2 ~ svychisq,
+      smoking.status ~ svychisq,
+      Insured ~ svychisq,
+      Insurance_status ~ svychisq,
+      PIR_cate ~ svychisq,
+      GLUC_calibrated ~ svyranktest,
+      HBA1C ~ svyranktest,
+      BMXBMI ~ svyranktest,
+      BMXWAIST ~ svyranktest,
+      LDL ~ svyranktest,
+      HDL ~ svyranktest,
+      TG ~ svyranktest,
+      BPXSAR ~ svyranktest,
+      BPXDAR ~ svyranktest,
+      AST ~ svyranktest,
+      ALT ~ svyranktest
+      ),
+    pvalue_fun = function(x) style_pvalue(x, digits = 3)  
+  ) %>%
+  bold_p(t = 0.05)  
+
+tbl_gt <- as_gt(tbl1)
+gtsave(tbl_gt, file = "tbl1.docx")
+
+print(tbl1)
+
+
+```
+
+#Table 2: Factors associated with adequate glycemic control in diagnosed diabetes.  2017-2023
+```{r}
+all3 <- all3 %>% mutate(
+  HBA1C_cate7 = ifelse(HBA1C<7, 1, 0), #1 adequate
+  HBA1C_cate8 = ifelse(HBA1C<8, 1, 0)  #1 adequate
+)
+all3 <- all3 %>% mutate(
+  HBA1C_inad7 = ifelse(HBA1C>=7, 1, 0)
+)
+#restrict to 2017-2023
+all3_dmdoc6612 <- all3%>% filter((cycle==12 | cycle==66) & DM.doc==1)
+all3_dmdoc6612 <- all3_dmdoc6612 %>% filter(age2 != "85+")
+all3_dmdoc6612$age2 <- droplevels(all3_dmdoc6612$age2)
+
+svy_design_t1 <- svydesign(
+  ids = ~SDMVPSU,
+  strata = ~SDMVSTRA,     
+  weights = ~weight.fasting,
+  data = all3_dmdoc6612,  
+  nest = TRUE
+)
+
+
+tbl2 <- tbl_svysummary(
+  svy_design_t1,   
+  by = HBA1C_cate7,  
+  include = all_of(vars),  
+  missing = "no",    
+  type = list(
+    age2 ~ "categorical",
+    sex ~ "categorical",
+    education ~ "categorical",
+    ridreth3 ~ "categorical",
+    birthcountry ~ "categorical",
+    income2 ~ "categorical",
+    smoking.status ~ "categorical",
+    Insured ~ "categorical",
+    Insurance_status ~ "categorical",
+    PIR_cate ~ "categorical",
+    GLUC_calibrated ~ "continuous",
+    HBA1C ~ "continuous",
+    BMXBMI ~ "continuous",
+    BMXWAIST ~ "continuous",
+    LDL ~ "continuous",
+    HDL ~ "continuous",
+    TG ~ "continuous",
+    BPXSAR ~ "continuous",
+    BPXDAR ~ "continuous",
+    AST ~ "continuous",
+    ALT ~ "continuous"
+  ),
+  statistic = list(
+    all_categorical() ~ "{n_unweighted} ({p}%)",  # Raw count and weighted %
+    all_continuous() ~ "{median} ({p25}, {p75})"  # Median and IQR for continuous
+  )
+) %>%
+  add_n(statistic = "{N_nonmiss_unweighted}") %>%
+  add_p(
+    test = list(
+      age2 ~ svychisq,
+      sex ~ svychisq,            
+      education ~ svychisq,
+      ridreth3 ~ svychisq,
+      birthcountry ~ svychisq,
+      income2 ~ svychisq,
+      smoking.status ~ svychisq,
+      Insured ~ svychisq,
+      Insurance_status ~ svychisq,
+      PIR_cate ~ svychisq,
+      GLUC_calibrated ~ svyranktest,
+      HBA1C ~ svyranktest,
+      BMXBMI ~ svyranktest,
+      BMXWAIST ~ svyranktest,
+      LDL ~ svyranktest,
+      HDL ~ svyranktest,
+      TG ~ svyranktest,
+      BPXSAR ~ svyranktest,
+      BPXDAR ~ svyranktest,
+      AST ~ svyranktest,
+      ALT ~ svyranktest
+      ),
+    pvalue_fun = function(x) style_pvalue(x, digits = 3)  
+  ) %>%
+  bold_p(t = 0.05)  
+
+
+tbl_gt <- as_gt(tbl2)
+gtsave(tbl_gt, file = "tbl2.docx")
+
+print(tbl2)
+
+```
+
+#Table 3: Secular trends in diabetes treatment among diagnosed diabetes. 
+```{r}
+all3 <- all3%>% 
+  mutate(Any_diabetes_drug = if_else(METF == 1 | SU == 1 | TZD == 1 | INSULIN == 1 | BAS == 1 |  GLINIDE == 1 | AGLUC == 1 | GLP1 == 1 | DPP4 == 1 | SGLT2 == 1, 1, 0),
+         other = if_else(AGLUC==1|BAS == 1 | GLINIDE==1, 1, 0 ))
+all3_dmdocex12 <- all3 %>% filter(cycle!=12 & DM.doc==1)
+
+# Define survey design
+svy_design_st2 <- svydesign(
+  ids = ~SDMVPSU,
+  strata = ~SDMVSTRA,   
+  weights = ~weight.fasting,
+  data = all3_dmdocex12,  
+  nest = TRUE
+)
+
+svy_design <- update(svy_design_st2)
+
+
+# Compute raw N
+raw_counts <- all3_dmdocex12 %>%
+  group_by(cycle_label_numeric) %>%
+  summarise(
+    N_unweighted = n(),
+    across(c(Any_diabetes_drug, METF, SU, SGLT2, GLP1, INSULIN, TZD, DPP4, other), 
+           ~sum(.), .names = "{.col}_raw"),
+    .groups = "drop"
+  )
+
+# Compute weighted percentages 
+weighted_stats <- svyby(
+  ~ Any_diabetes_drug + METF + SU + SGLT2 + GLP1 + INSULIN + TZD + DPP4 + other,
+  by = ~ cycle_label_numeric,
+  design = svy_design,
+  FUN = svymean ,
+  na.rm = TRUE
+)
+
+```
+
+
+# Supp Table 4: Factors associated with adequate glycemic control in people diagnosed with diabetes
+```{r}
+# create factors levels
+all3_dmdoc = all3 %>% filter(DM.doc==1) %>%
+  mutate(
+    race5 = ifelse(
+      race4 %in% c("Non-Hispanic Asian", "Other Race - Including Multi-Racial") , "Other", race4
+    ))%>%
+  mutate(
+    race_level = factor(
+      race5,
+      levels = c("Non-Hispanic White", "Non-Hispanic Black", "Hispanic/Latino", "Other")
+    ),
+    education_level = factor(
+      education,
+      levels = c("Less than 9th grade", "9-11th grade (Includes 12th grade with no diploma)", "High school graduate/GED or equivalent", "Some college or AA degree", "College graduate or above")
+    ),
+    sex_level = factor(sex),
+    birthcountry_level = factor(birthcountry),
+    DM_insulin_level = factor(DM.insulin, levels = c("No", "Yes")),
+    DM_pills_level = factor(DM.pills, levels = c("No", "Yes"))
+  )
+
+#univariate logistic regression
+all3_doc6612 <- all3_dmdoc %>% filter(cycle==66|cycle==12)
+library(broom)
+svy_design <- svydesign(
+  ids = ~SDMVPSU,
+  strata = ~SDMVSTRA,
+  weights = ~weight.fasting,
+  nest = TRUE,
+  data = all3_doc6612
+  
+)
+
+univariable_results <- list()
+
+# Predictors
+predictors <- c("age", "sex_level", "race_level", "education_level", "birthcountry_level", "DM.insulin", "DM.pills")
+
+for (predictor in predictors) {
+  formula <- as.formula(paste("HBA1C_cate7 ~", predictor))
+  
+  # logistic regression
+  model <- svyglm(formula, design = svy_design, family = binomial)
+  
+  result <- tidy(model, exponentiate = TRUE, conf.int = TRUE)
+ 
+  univariable_results[[predictor]] <- result
+}
+
+univariable_results_df <- bind_rows(univariable_results, .id = "Predictor")
+univariable_results_df <- univariable_results_df %>% select(term, estimate, conf.low, conf.high, p.value)
+
+# Adjusted models were adjusted for all factors associated with inadequate glycemic control as p<0.1 in unadjusted analyses
+
+multivariable_model <- svyglm(
+  HBA1C_cate7 ~ age + sex_level + education_level + DM.insulin,
+  design = svy_design,
+  family = binomial
+)
+summary(multivariable_model)
+result <- tidy(multivariable_model, exponentiate = TRUE, conf.int = TRUE)
+result <- result %>% select(term, estimate, conf.low, conf.high, p.value)
+```
+
+# Supp. Table 6: Factors associated with adequate glycemic control in all diabetes. 2017-2023
+```{r}
+all3_dmall <- all3 %>% 
+  filter(DM.all==1)
+all3_dmall6612 <- all3_dmall %>% filter(cycle==66|cycle==12)
+all3_dmall6612 <- all3_dmall6612 %>% filter(age2 != "85+")
+all3_dmall6612$age2 <- droplevels(all3_dmall6612$age2)
+
+svy_design_t1 <- svydesign(
+  ids = ~SDMVPSU,
+  strata = ~SDMVSTRA,     
+  weights = ~weight.fasting,
+  data = all3_dmall6612,  
+  nest = TRUE
+)
+
+stbl1 <- tbl_svysummary(
+  svy_design_t1,   
+  by = HBA1C_cate7,  
+  include = all_of(vars),  
+  missing = "no",    
+  type = list(
+    age2 ~ "categorical",
+    sex ~ "categorical",
+    education ~ "categorical",
+    ridreth3 ~ "categorical",
+    birthcountry ~ "categorical",
+    income2 ~ "categorical",
+    smoking.status ~ "categorical",
+    Insured ~ "categorical",
+    Insurance_status ~ "categorical",
+    PIR_cate ~ "categorical",
+    GLUC_calibrated ~ "continuous",
+    HBA1C ~ "continuous",
+    BMXBMI ~ "continuous",
+    BMXWAIST ~ "continuous",
+    LDL ~ "continuous",
+    HDL ~ "continuous",
+    TG ~ "continuous",
+    BPXSAR ~ "continuous",
+    BPXDAR ~ "continuous",
+    AST ~ "continuous",
+    ALT ~ "continuous"
+  ),
+  statistic = list(
+    all_categorical() ~ "{n_unweighted} ({p}%)",  # Raw count and weighted %
+    all_continuous() ~ "{median} ({p25}, {p75})"  # Median and IQR for continuous
+  )
+) %>%
+  add_n(statistic = "{N_nonmiss_unweighted}") %>%
+  add_p(
+    test = list(
+      age2 ~ svychisq,
+      sex ~ svychisq,            
+      education ~ svychisq,
+      ridreth3 ~ svychisq,
+      birthcountry ~ svychisq,
+      income2 ~ svychisq,
+      smoking.status ~ svychisq,
+      Insured ~ svychisq,
+      Insurance_status ~ svychisq,
+      PIR_cate ~ svychisq,
+      GLUC_calibrated ~ svyranktest,
+      HBA1C ~ svyranktest,
+      BMXBMI ~ svyranktest,
+      BMXWAIST ~ svyranktest,
+      LDL ~ svyranktest,
+      HDL ~ svyranktest,
+      TG ~ svyranktest,
+      BPXSAR ~ svyranktest,
+      BPXDAR ~ svyranktest,
+      AST ~ svyranktest,
+      ALT ~ svyranktest
+      ),
+    pvalue_fun = function(x) style_pvalue(x, digits = 3)  
+  ) %>%
+  bold_p(t = 0.05)  
+
+
+tbl_gt <- as_gt(stbl1)
+gtsave(tbl_gt, file = "stbl1.docx")
+
+print(stbl1)
+```
+
+
+# Supp. Table 7: Adequacy of blood pressure control in diagnosed diabetes.
+```{r}
+all3 <- all3 %>% 
+  mutate(adequate_bp_control = ifelse(BPXSAR >= 130 | BPXDAR >= 80, 1, 0))
+svy_design_st2 <- svydesign(
+  ids = ~SDMVPSU,
+  strata = ~SDMVSTRA,   
+  weights = ~weight.fasting,
+  data = all3,  
+  nest = TRUE
+)
+
+svy_design <- update(svy_design_st2, sex = as.factor(sex))
+svy_design <- subset(svy_design, DM.doc==1) 
+#svy_design <- subset(svy_design, cycle==66|cycle==12) #only 2017-2023
+summary_stats <- svyby(
+  ~adequate_bp_control,
+  by = ~sex,
+  design = svy_design,
+  svymean,
+  na.rm = TRUE
+)
+  
+
+raw_counts <- all3 %>%
+  filter(DM.doc == 1 )%>%
+  group_by(sex) %>%
+  summarise(
+    n_unweighted = sum(adequate_bp_control, na.rm = TRUE),
+    N_unweighted = n(),
+    .groups = "drop"
+  )
+
+# raw N with weighted percentages
+final_summary <- summary_stats %>%
+  as.data.frame() %>%
+  left_join(raw_counts, by = "sex") %>%  
+  rowwise() %>%
+  mutate(
+    Percent = round(adequate_bp_control * 100, 1),
+    `Adequate BP control (n/N, %)` = paste0(
+      n_unweighted, "/", N_unweighted, " (", Percent, "%)"
+    )
+  ) %>%
+  ungroup() %>%
+  select(sex, `Adequate BP control (n/N, %)`) 
+print(final_summary)
+
+chi_sq_test <- svychisq(
+    ~adequate_bp_control + sex,
+    design = svy_design
+  )
+chi_sq_test$p.value
+
+```
+
+
+```{r}
+all3 <- all3 %>% mutate(
+  race4 = ifelse(ridreth3 == "Mexican American" | ridreth3 == "Other Hispanic", "Hispanic/Latino", ridreth3)
+) %>% 
+  mutate(race4 = case_when(
+    race4 == 3 ~ "Non-Hispanic White",
+    race4 == 4 ~ "Non-Hispanic Black",
+    race4 == 5 ~ "Other Race - Including Multi-Racial",
+    race4 == 6 ~ "Non-Hispanic Asian",
+    race4 == "Hispanic/Latino" ~ "Hispanic/Latino"
+  ))
+
+
+svy_design_st2 <- svydesign(
+  ids = ~SDMVPSU,
+  strata = ~SDMVSTRA,   
+  weights = ~weight.fasting,
+  data = all3,  
+  nest = TRUE
+)
+
+svy_design <- update(svy_design_st2, race4 = as.factor(race4))
+svy_design <- subset(svy_design, DM.doc==1) 
+#svy_design <- subset(svy_design, cycle==66|cycle==12) #only 2017-2023
+summary_stats <- svyby(
+  ~adequate_bp_control,
+  by = ~race4,
+  design = svy_design,
+  svymean,
+  na.rm = TRUE
+)
+  
+
+raw_counts <- all3 %>%
+  filter(DM.doc == 1) %>%
+  group_by(race4) %>%
+  summarise(
+    n_unweighted = sum(adequate_bp_control, na.rm = TRUE),
+    N_unweighted = n(),
+    .groups = "drop"
+  )
+
+# raw N with weighted percentages
+final_summary <- summary_stats %>%
+  as.data.frame() %>%
+  left_join(raw_counts, by = "race4") %>%  
+  rowwise() %>%
+  mutate(
+    Percent = round(adequate_bp_control * 100, 1),
+    `Adequate BP control (n/N, %)` = paste0(
+      n_unweighted, "/", N_unweighted, " (", Percent, "%)"
+    )
+  ) %>%
+  ungroup() %>%
+  select(race4, `Adequate BP control (n/N, %)`) 
+print(final_summary)
+
+chi_sq_test <- svychisq(
+    ~adequate_bp_control + race4,
+    design = svy_design
+  )
+chi_sq_test$p.value
+
+```
+
+
+```{r}
+
+svy_design_st2 <- svydesign(
+  ids = ~SDMVPSU,
+  strata = ~SDMVSTRA,   
+  weights = ~weight.fasting,
+  data = all3,  
+  nest = TRUE
+)
+
+svy_design <- update(svy_design_st2, birthcountry = as.factor(birthcountry))
+svy_design <- subset(svy_design, DM.doc==1) 
+#svy_design <- subset(svy_design, cycle==66|cycle==12) #only 2017-2023
+summary_stats <- svyby(
+  ~adequate_bp_control,
+  by = ~birthcountry,
+  design = svy_design,
+  svymean,
+  na.rm = TRUE
+)
+  
+  
+raw_counts <- all3 %>%
+  filter(DM.doc == 1) %>%
+  group_by(birthcountry) %>%
+  summarise(
+    n_unweighted = sum(adequate_bp_control, na.rm = TRUE),
+    N_unweighted = n(),
+    .groups = "drop"
+  )
+
+# raw N with weighted percentages
+final_summary <- summary_stats %>%
+  as.data.frame() %>%
+  left_join(raw_counts, by = "birthcountry") %>%  
+  rowwise() %>%
+  mutate(
+    Percent = round(adequate_bp_control * 100, 1),
+    `Adequate BP control (n/N, %)` = paste0(
+      n_unweighted, "/", N_unweighted, " (", Percent, "%)"
+    )
+  ) %>%
+  ungroup() %>%
+  select(birthcountry, `Adequate BP control (n/N, %)`) 
+print(final_summary)
+
+chi_sq_test <- svychisq(
+    ~adequate_bp_control + birthcountry,
+    design = svy_design
+  )
+chi_sq_test$p.value
+
+```
+
+```{r}
+
+svy_design_st2 <- svydesign(
+  ids = ~SDMVPSU,
+  strata = ~SDMVSTRA,   
+  weights = ~weight.fasting,
+  data = all3,  
+  nest = TRUE
+)
+
+svy_design <- update(svy_design_st2, education = as.factor(education))
+svy_design <- subset(svy_design, DM.doc==1) 
+#svy_design <- subset(svy_design, cycle==66|cycle==12) #only 2017-2023
+summary_stats <- svyby(
+  ~adequate_bp_control,
+  by = ~education,
+  design = svy_design,
+  svymean,
+  na.rm = TRUE
+)
+
+  
+raw_counts <- all3 %>%
+  filter(DM.doc == 1 ) %>%
+  group_by(education) %>%
+  summarise(
+    n_unweighted = sum(adequate_bp_control, na.rm = TRUE),
+    N_unweighted = n(),
+    .groups = "drop"
+  )
+
+# raw N with weighted percentages
+final_summary <- summary_stats %>%
+  as.data.frame() %>%
+  left_join(raw_counts, by = "education") %>%  
+  rowwise() %>%
+  mutate(
+    Percent = round(adequate_bp_control * 100, 1),
+    `Adequate BP control (n/N, %)` = paste0(
+      n_unweighted, "/", N_unweighted, " (", Percent, "%)"
+    )
+  ) %>%
+  ungroup() %>%
+  select(education, `Adequate BP control (n/N, %)`) 
+print(final_summary)
+
+chi_sq_test <- svychisq(
+    ~adequate_bp_control + education,
+    design = svy_design
+  )
+chi_sq_test$p.value
+
+```
+
+
+```{r}
+
+svy_design_st2 <- svydesign(
+  ids = ~SDMVPSU,
+  strata = ~SDMVSTRA,   
+  weights = ~weight.fasting,
+  data = all3,  
+  nest = TRUE
+)
+
+svy_design <- update(svy_design_st2, Insurance_status = as.factor(Insurance_status))
+svy_design <- subset(svy_design, DM.doc==1) 
+#svy_design <- subset(svy_design, cycle==66|cycle==12) #only 2017-2023
+summary_stats <- svyby(
+  ~adequate_bp_control,
+  by = ~Insurance_status,
+  design = svy_design,
+  svymean,
+  na.rm = TRUE
+)
+
+  
+raw_counts <- all3 %>%
+  filter(DM.doc == 1 ) %>%
+  group_by(Insurance_status) %>%
+  summarise(
+    n_unweighted = sum(adequate_bp_control, na.rm = TRUE),
+    N_unweighted = n(),
+    .groups = "drop"
+  )
+
+# raw N with weighted percentages
+final_summary <- summary_stats %>%
+  as.data.frame() %>%
+  left_join(raw_counts, by = "Insurance_status") %>%  
+  rowwise() %>%
+  mutate(
+    Percent = round(adequate_bp_control * 100, 1),
+    `Adequate BP control (n/N, %)` = paste0(
+      n_unweighted, "/", N_unweighted, " (", Percent, "%)"
+    )
+  ) %>%
+  ungroup() %>%
+  select(Insurance_status, `Adequate BP control (n/N, %)`) 
+print(final_summary)
+
+chi_sq_test <- svychisq(
+    ~adequate_bp_control + Insurance_status,
+    design = svy_design
+  )
+chi_sq_test$p.value
+
+```
+
+
+```{r}
+
+svy_design_st2 <- svydesign(
+  ids = ~SDMVPSU,
+  strata = ~SDMVSTRA,   
+  weights = ~weight.fasting,
+  data = all3,  
+  nest = TRUE
+)
+
+svy_design <- update(svy_design_st2, PIR_cate = as.factor(PIR_cate))
+svy_design <- subset(svy_design, DM.doc==1) 
+#svy_design <- subset(svy_design, cycle==66|cycle==12) #only 2017-2023
+summary_stats <- svyby(
+  ~adequate_bp_control,
+  by = ~PIR_cate,
+  design = svy_design,
+  svymean,
+  na.rm = TRUE
+)
+
+  
+raw_counts <- all3 %>%
+  filter(DM.doc == 1 ) %>%
+  group_by(PIR_cate) %>%
+  summarise(
+    n_unweighted = sum(adequate_bp_control, na.rm = TRUE),
+    N_unweighted = n(),
+    .groups = "drop"
+  )
+
+# raw N with weighted percentages
+final_summary <- summary_stats %>%
+  as.data.frame() %>%
+  left_join(raw_counts, by = "PIR_cate") %>%  
+  rowwise() %>%
+  mutate(
+    Percent = round(adequate_bp_control * 100, 1),
+    `Adequate BP control (n/N, %)` = paste0(
+      n_unweighted, "/", N_unweighted, " (", Percent, "%)"
+    )
+  ) %>%
+  ungroup() %>%
+  select(PIR_cate, `Adequate BP control (n/N, %)`) 
+print(final_summary)
+
+chi_sq_test <- svychisq(
+    ~adequate_bp_control + PIR_cate,
+    design = svy_design
+  )
+chi_sq_test$p.value
+
+```
+
+# Supp. Table 8: Adequacy of low density lipoprotein control in diagnosed diabetes.
+```{r}
+all3 <- all3 %>% 
+  mutate(adequate_ldl_control = ifelse(LDL>=70, 1, 0)) #1 inadequate
+
+all3_ex12 <- all3 %>% filter(cycle!=12)
+svy_design_st2 <- svydesign(
+  ids = ~SDMVPSU,
+  strata = ~SDMVSTRA,   
+  weights = ~weight.fasting,
+  data = all3_ex12,  
+  nest = TRUE
+)
+svy_design <- update(svy_design_st2, cycle_label = as.factor(cycle_label))
+
+svy_design <- subset(svy_design, DM.doc==1) 
+
+summary_stats <- svyby(
+  ~adequate_ldl_control,
+  by = ~cycle_label,
+  design = svy_design,
+  svymean,
+  na.rm = TRUE
+)
+  
+raw_counts <- all3_ex12 %>%
+  filter(DM.doc == 1) %>%
+  group_by(cycle_label) %>%
+  summarise(
+    n_unweighted = sum(adequate_ldl_control, na.rm = TRUE),
+    N_unweighted = n(),
+    .groups = "drop"
+  )
+
+# raw N with weighted percentages
+final_summary <- summary_stats %>%
+  as.data.frame() %>%
+  left_join(raw_counts, by = "cycle_label") %>%  
+  rowwise() %>%
+  mutate(
+    Percent = round(adequate_ldl_control * 100, 1),
+    `Adequate BP control (n/N, %)` = paste0(
+      n_unweighted, "/", N_unweighted, " (", Percent, "%)"
+    )
+  ) %>%
+  ungroup() %>%
+  select(cycle_label, `Adequate BP control (n/N, %)`) 
+print(final_summary)
+
+chi_sq_test <- svychisq(
+    ~adequate_ldl_control + cycle_label,
+    design = svy_design
+  )
+chi_sq_test$p.value
+
+```
+
+
+```{r}
+svy_design_st2 <- svydesign(
+  ids = ~SDMVPSU,
+  strata = ~SDMVSTRA,   
+  weights = ~weight.fasting,
+  data = all3_ex12,  
+  nest = TRUE
+)
+
+svy_design <- update(svy_design_st2, sex = as.factor(sex))
+
+svy_design <- subset(svy_design, DM.doc==1) 
+svy_design <- subset(svy_design, cycle==66|cycle==12) #only 2017-2023
+
+  
+summary_stats <- svyby(
+  ~adequate_ldl_control,
+  by = ~sex,
+  design = svy_design,
+  svymean,
+  na.rm = TRUE
+)
+  
+raw_counts <- all3_ex12 %>%
+  filter(DM.doc == 1) %>%
+  group_by(sex) %>%
+  summarise(
+    n_unweighted = sum(adequate_ldl_control, na.rm = TRUE),
+    N_unweighted = n(),
+    .groups = "drop"
+  )
+
+# raw N with weighted percentages
+final_summary <- summary_stats %>%
+  as.data.frame() %>%
+  left_join(raw_counts, by = "sex") %>%  
+  rowwise() %>%
+  mutate(
+    Percent = round(adequate_ldl_control * 100, 1),
+    `Adequate BP control (n/N, %)` = paste0(
+      n_unweighted, "/", N_unweighted, " (", Percent, "%)"
+    )
+  ) %>%
+  ungroup() %>%
+  select(sex, `Adequate BP control (n/N, %)`) 
+print(final_summary)
+
+chi_sq_test <- svychisq(
+    ~adequate_ldl_control + sex,
+    design = svy_design
+  )
+chi_sq_test$p.value
+
+```
+
+```{r}
+
+svy_design_st2 <- svydesign(
+  ids = ~SDMVPSU,
+  strata = ~SDMVSTRA,   
+  weights = ~weight.fasting,
+  data = all3_ex12,  
+  nest = TRUE
+)
+
+svy_design <- update(svy_design_st2, race4 = as.factor(race4))
+
+svy_design <- subset(svy_design, DM.doc==1) 
+svy_design <- subset(svy_design, cycle==66|cycle==12) #only 2017-2023
+
+  
+summary_stats <- svyby(
+  ~adequate_ldl_control,
+  by = ~race4,
+  design = svy_design,
+  svymean,
+  na.rm = TRUE
+)
+  
+raw_counts <- all3_ex12 %>%
+  filter(DM.doc == 1 ) %>%
+  group_by(race4) %>%
+  summarise(
+    n_unweighted = sum(adequate_ldl_control, na.rm = TRUE),
+    N_unweighted = n(),
+    .groups = "drop"
+  )
+
+# raw N with weighted percentages
+final_summary <- summary_stats %>%
+  as.data.frame() %>%
+  left_join(raw_counts, by = "race4") %>%  
+  rowwise() %>%
+  mutate(
+    Percent = round(adequate_ldl_control * 100, 1),
+    `Adequate BP control (n/N, %)` = paste0(
+      n_unweighted, "/", N_unweighted, " (", Percent, "%)"
+    )
+  ) %>%
+  ungroup() %>%
+  select(race4, `Adequate BP control (n/N, %)`) 
+print(final_summary)
+
+chi_sq_test <- svychisq(
+    ~adequate_ldl_control + race4,
+    design = svy_design
+  )
+chi_sq_test$p.value
+
+```
+
+
+```{r}
+
+svy_design_st2 <- svydesign(
+  ids = ~SDMVPSU,
+  strata = ~SDMVSTRA,   
+  weights = ~weight.fasting,
+  data = all3_ex12,  
+  nest = TRUE
+)
+
+svy_design <- update(svy_design_st2, birthcountry = as.factor(birthcountry))
+svy_design <- subset(svy_design, DM.doc==1) 
+svy_design <- subset(svy_design, cycle==66|cycle==12) #only 2017-2023
+
+summary_stats <- svyby(
+  ~adequate_ldl_control,
+  by = ~birthcountry,
+  design = svy_design,
+  svymean,
+  na.rm = TRUE
+)
+  
+raw_counts <- all3_ex12 %>%
+  filter(DM.doc == 1) %>%
+  group_by(birthcountry) %>%
+  summarise(
+    n_unweighted = sum(adequate_ldl_control, na.rm = TRUE),
+    N_unweighted = n(),
+    .groups = "drop"
+  )
+
+# raw N with weighted percentages
+final_summary <- summary_stats %>%
+  as.data.frame() %>%
+  left_join(raw_counts, by = "birthcountry") %>%  
+  rowwise() %>%
+  mutate(
+    Percent = round(adequate_ldl_control * 100, 1),
+    `Adequate BP control (n/N, %)` = paste0(
+      n_unweighted, "/", N_unweighted, " (", Percent, "%)"
+    )
+  ) %>%
+  ungroup() %>%
+  select(birthcountry, `Adequate BP control (n/N, %)`) 
+print(final_summary)
+
+chi_sq_test <- svychisq(
+    ~adequate_ldl_control + birthcountry,
+    design = svy_design
+  )
+chi_sq_test$p.value
+
+```
+
+```{r}
+
+svy_design_st2 <- svydesign(
+  ids = ~SDMVPSU,
+  strata = ~SDMVSTRA,   
+  weights = ~weight.fasting,
+  data = all3_ex12,  
+  nest = TRUE
+)
+
+svy_design <- update(svy_design_st2, Insurance_status = as.factor(Insurance_status))
+svy_design <- subset(svy_design, DM.doc==1) 
+svy_design <- subset(svy_design, cycle==66|cycle==12) #only 2017-2023
+
+  
+summary_stats <- svyby(
+  ~adequate_ldl_control,
+  by = ~Insurance_status,
+  design = svy_design,
+  svymean,
+  na.rm = TRUE
+)
+  
+raw_counts <- all3_ex12 %>%
+  filter(DM.doc == 1 & cycle==66) %>%
+  group_by(Insurance_status) %>%
+  summarise(
+    n_unweighted = sum(adequate_ldl_control, na.rm = TRUE),
+    N_unweighted = n(),
+    .groups = "drop"
+  )
+
+# raw N with weighted percentages
+final_summary <- summary_stats %>%
+  as.data.frame() %>%
+  left_join(raw_counts, by = "Insurance_status") %>%  
+  rowwise() %>%
+  mutate(
+    Percent = round(adequate_ldl_control * 100, 1),
+    `Adequate BP control (n/N, %)` = paste0(
+      n_unweighted, "/", N_unweighted, " (", Percent, "%)"
+    )
+  ) %>%
+  ungroup() %>%
+  select(Insurance_status, `Adequate BP control (n/N, %)`) 
+print(final_summary)
+
+chi_sq_test <- svychisq(
+    ~adequate_ldl_control + Insurance_status,
+    design = svy_design
+  )
+chi_sq_test$p.value
+
+```
+
+
+```{r}
+svy_design_st2 <- svydesign(
+  ids = ~SDMVPSU,
+  strata = ~SDMVSTRA,   
+  weights = ~weight.fasting,
+  data = all3_ex12,  
+  nest = TRUE
+)
+
+svy_design <- update(svy_design_st2, PIR_cate = as.factor(PIR_cate))
+svy_design <- subset(svy_design, DM.doc==1) 
+svy_design <- subset(svy_design, cycle==66|cycle==12) #only 2017-2023
+
+  
+summary_stats <- svyby(
+  ~adequate_ldl_control,
+  by = ~PIR_cate,
+  design = svy_design,
+  svymean,
+  na.rm = TRUE
+)
+  
+raw_counts <- all3_ex12 %>%
+  filter(DM.doc == 1 & cycle==66) %>%
+  group_by(PIR_cate) %>%
+  summarise(
+    n_unweighted = sum(adequate_ldl_control, na.rm = TRUE),
+    N_unweighted = n(),
+    .groups = "drop"
+  )
+
+# raw N with weighted percentages
+final_summary <- summary_stats %>%
+  as.data.frame() %>%
+  left_join(raw_counts, by = "PIR_cate") %>%  
+  rowwise() %>%
+  mutate(
+    Percent = round(adequate_ldl_control * 100, 1),
+    `Adequate BP control (n/N, %)` = paste0(
+      n_unweighted, "/", N_unweighted, " (", Percent, "%)"
+    )
+  ) %>%
+  ungroup() %>%
+  select(PIR_cate, `Adequate BP control (n/N, %)`) 
+print(final_summary)
+
+chi_sq_test <- svychisq(
+    ~adequate_ldl_control + PIR_cate,
+    design = svy_design
+  )
+chi_sq_test$p.value
+
+```
+
+```{r}
+
+svy_design_st2 <- svydesign(
+  ids = ~SDMVPSU,
+  strata = ~SDMVSTRA,   
+  weights = ~weight.fasting,
+  data = all3_ex12,  
+  nest = TRUE
+)
+
+svy_design <- update(svy_design_st2, education = as.factor(education))
+svy_design <- subset(svy_design, DM.doc==1) 
+svy_design <- subset(svy_design, cycle==66|cycle==12) #only 2017-2023
+
+  
+summary_stats <- svyby(
+  ~adequate_ldl_control,
+  by = ~education,
+  design = svy_design,
+  svymean,
+  na.rm = TRUE
+)
+  
+raw_counts <- all3_ex12 %>%
+  filter(DM.doc == 1 ) %>%
+  group_by(education) %>%
+  summarise(
+    n_unweighted = sum(adequate_ldl_control, na.rm = TRUE),
+    N_unweighted = n(),
+    .groups = "drop"
+  )
+
+# raw N with weighted percentages
+final_summary <- summary_stats %>%
+  as.data.frame() %>%
+  left_join(raw_counts, by = "education") %>%  
+  rowwise() %>%
+  mutate(
+    Percent = round(adequate_ldl_control * 100, 1),
+    `Adequate BP control (n/N, %)` = paste0(
+      n_unweighted, "/", N_unweighted, " (", Percent, "%)"
+    )
+  ) %>%
+  ungroup() %>%
+  select(education, `Adequate BP control (n/N, %)`) 
+print(final_summary)
+
+chi_sq_test <- svychisq(
+    ~adequate_ldl_control + education,
+    design = svy_design
+  )
+chi_sq_test$p.value
+
+```
+
+
+
+#Supp. Table 8: Adequacy of low density lipoprotein control in diagnosed diabetes.
+```{r}
+all3 <- all3 %>% 
+  mutate(adequate_ldl_control2 = ifelse(LDL>=70 & STATIN==0, 1, 0)) #low density lipoprotein level ≥ 70 mg/dL and not taking a statin
+
+all3_ex12 <- all3 %>% filter(cycle!=12)
+svy_design_st2 <- svydesign(
+  ids = ~SDMVPSU,
+  strata = ~SDMVSTRA,   
+  weights = ~weight.fasting,
+  data = all3_ex12,  
+  nest = TRUE
+)
+svy_design <- update(svy_design_st2, cycle_label = as.factor(cycle_label))
+
+svy_design <- subset(svy_design, DM.doc==1) 
+
+summary_stats <- svyby(
+  ~adequate_ldl_control2,
+  by = ~cycle_label,
+  design = svy_design,
+  svymean,
+  na.rm = TRUE
+)
+  
+raw_counts <- all3_ex12 %>%
+  filter(DM.doc == 1) %>%
+  group_by(cycle_label) %>%
+  summarise(
+    n_unweighted = sum(adequate_ldl_control2, na.rm = TRUE),
+    N_unweighted = n(),
+    .groups = "drop"
+  )
+
+# raw N with weighted percentages
+final_summary <- summary_stats %>%
+  as.data.frame() %>%
+  left_join(raw_counts, by = "cycle_label") %>%  
+  rowwise() %>%
+  mutate(
+    Percent = round(adequate_ldl_control2 * 100, 1),
+    `Adequate BP control (n/N, %)` = paste0(
+      n_unweighted, "/", N_unweighted, " (", Percent, "%)"
+    )
+  ) %>%
+  ungroup() %>%
+  select(cycle_label, `Adequate BP control (n/N, %)`) 
+print(final_summary)
+#summary_stats %>% 
+#  summarise(n = sum(N))
+chi_sq_test <- svychisq(
+    ~adequate_ldl_control2 + cycle_label,
+    design = svy_design
+  )
+chi_sq_test$p.value
+
+```
+
+
+```{r}
+svy_design_st2 <- svydesign(
+  ids = ~SDMVPSU,
+  strata = ~SDMVSTRA,   
+  weights = ~weight.fasting,
+  data = all3_ex12,  
+  nest = TRUE
+)
+
+svy_design <- update(svy_design_st2, sex = as.factor(sex))
+
+svy_design <- subset(svy_design, DM.doc==1) 
+svy_design <- subset(svy_design, cycle==66|cycle==12) #only 2017-2023
+
+  
+summary_stats <- svyby(
+  ~adequate_ldl_control2,
+  by = ~sex,
+  design = svy_design,
+  svymean,
+  na.rm = TRUE
+)
+  
+raw_counts <- all3_ex12 %>%
+  filter(DM.doc == 1) %>%
+  group_by(sex) %>%
+  summarise(
+    n_unweighted = sum(adequate_ldl_control2, na.rm = TRUE),
+    N_unweighted = n(),
+    .groups = "drop"
+  )
+
+# raw N with weighted percentages
+final_summary <- summary_stats %>%
+  as.data.frame() %>%
+  left_join(raw_counts, by = "sex") %>%  
+  rowwise() %>%
+  mutate(
+    Percent = round(adequate_ldl_control2 * 100, 1),
+    `Adequate BP control (n/N, %)` = paste0(
+      n_unweighted, "/", N_unweighted, " (", Percent, "%)"
+    )
+  ) %>%
+  ungroup() %>%
+  select(sex, `Adequate LDL control (n/N, %)`) 
+print(final_summary)
+
+chi_sq_test <- svychisq(
+    ~adequate_ldl_control2 + sex,
+    design = svy_design
+  )
+chi_sq_test$p.value
+
+```
+
+```{r}
+svy_design_st2 <- svydesign(
+  ids = ~SDMVPSU,
+  strata = ~SDMVSTRA,   
+  weights = ~weight.fasting,
+  data = all3_ex12,  
+  nest = TRUE
+)
+
+svy_design <- update(svy_design_st2, race4 = as.factor(race4))
+svy_design <- subset(svy_design, DM.doc==1) 
+svy_design <- subset(svy_design, cycle==66|cycle==12) #only 2017-2023
+
+  
+summary_stats <- svyby(
+  ~adequate_ldl_control2,
+  by = ~race4,
+  design = svy_design,
+  svymean,
+  na.rm = TRUE
+)
+  
+raw_counts <- all3_ex12 %>%
+  filter(DM.doc == 1) %>%
+  group_by(race4) %>%
+  summarise(
+    n_unweighted = sum(adequate_ldl_control2, na.rm = TRUE),
+    N_unweighted = n(),
+    .groups = "drop"
+  )
+
+# raw N with weighted percentages
+final_summary <- summary_stats %>%
+  as.data.frame() %>%
+  left_join(raw_counts, by = "race4") %>%  
+  rowwise() %>%
+  mutate(
+    Percent = round(adequate_ldl_control2 * 100, 1),
+    `Adequate BP control (n/N, %)` = paste0(
+      n_unweighted, "/", N_unweighted, " (", Percent, "%)"
+    )
+  ) %>%
+  ungroup() %>%
+  select(race4, `Adequate BP control (n/N, %)`) 
+print(final_summary)
+
+chi_sq_test <- svychisq(
+    ~adequate_ldl_control2 + race4,
+    design = svy_design
+  )
+chi_sq_test$p.value
+
+```
+
+
+```{r}
+svy_design_st2 <- svydesign(
+  ids = ~SDMVPSU,
+  strata = ~SDMVSTRA,   
+  weights = ~weight.fasting,
+  data = all3_ex12,  
+  nest = TRUE
+)
+
+svy_design <- update(svy_design_st2, birthcountry = as.factor(birthcountry))
+svy_design <- subset(svy_design, DM.doc==1) 
+svy_design <- subset(svy_design, cycle==66|cycle==12) #only 2017-2023
+
+  
+summary_stats <- svyby(
+  ~adequate_ldl_control2,
+  by = ~birthcountry,
+  design = svy_design,
+  svymean,
+  na.rm = TRUE
+)
+  
+raw_counts <- all3_ex12 %>%
+  filter(DM.doc == 1 ) %>%
+  group_by(birthcountry) %>%
+  summarise(
+    n_unweighted = sum(adequate_ldl_control2, na.rm = TRUE),
+    N_unweighted = n(),
+    .groups = "drop"
+  )
+
+# raw N with weighted percentages
+final_summary <- summary_stats %>%
+  as.data.frame() %>%
+  left_join(raw_counts, by = "birthcountry") %>%  
+  rowwise() %>%
+  mutate(
+    Percent = round(adequate_ldl_control2 * 100, 1),
+    `Adequate BP control (n/N, %)` = paste0(
+      n_unweighted, "/", N_unweighted, " (", Percent, "%)"
+    )
+  ) %>%
+  ungroup() %>%
+  select(birthcountry, `Adequate BP control (n/N, %)`) 
+print(final_summary)
+
+chi_sq_test <- svychisq(
+    ~adequate_ldl_control2 + birthcountry,
+    design = svy_design
+  )
+chi_sq_test$p.value
+
+```
+
+```{r}
+svy_design_st2 <- svydesign(
+  ids = ~SDMVPSU,
+  strata = ~SDMVSTRA,   
+  weights = ~weight.fasting,
+  data = all3_ex12,  
+  nest = TRUE
+)
+
+svy_design <- update(svy_design_st2, education = as.factor(education))
+svy_design <- subset(svy_design, DM.doc==1) 
+svy_design <- subset(svy_design, cycle==66|cycle==12) #only 2017-2023
+
+  
+summary_stats <- svyby(
+  ~adequate_ldl_control2,
+  by = ~education,
+  design = svy_design,
+  svymean,
+  na.rm = TRUE
+)
+  
+raw_counts <- all3_ex12 %>%
+  filter(DM.doc == 1 ) %>%
+  group_by(education) %>%
+  summarise(
+    n_unweighted = sum(adequate_ldl_control2, na.rm = TRUE),
+    N_unweighted = n(),
+    .groups = "drop"
+  )
+
+# raw N with weighted percentages
+final_summary <- summary_stats %>%
+  as.data.frame() %>%
+  left_join(raw_counts, by = "education") %>%  
+  rowwise() %>%
+  mutate(
+    Percent = round(adequate_ldl_control2 * 100, 1),
+    `Adequate BP control (n/N, %)` = paste0(
+      n_unweighted, "/", N_unweighted, " (", Percent, "%)"
+    )
+  ) %>%
+  ungroup() %>%
+  select(education, `Adequate BP control (n/N, %)`) 
+print(final_summary)
+
+chi_sq_test <- svychisq(
+    ~adequate_ldl_control2 + education,
+    design = svy_design
+  )
+chi_sq_test$p.value
+
+```
+
+```{r}
+svy_design_st2 <- svydesign(
+  ids = ~SDMVPSU,
+  strata = ~SDMVSTRA,   
+  weights = ~weight.fasting,
+  data = all3_ex12,  
+  nest = TRUE
+)
+
+svy_design <- update(svy_design_st2, Insurance_status = as.factor(Insurance_status))
+svy_design <- subset(svy_design, DM.doc==1) 
+svy_design <- subset(svy_design, cycle==66|cycle==12) #only 2017-2023
+
+  
+summary_stats <- svyby(
+  ~adequate_ldl_control2,
+  by = ~Insurance_status,
+  design = svy_design,
+  svymean,
+  na.rm = TRUE
+)
+  
+raw_counts <- all3_ex12 %>%
+  filter(DM.doc == 1 & cycle==66) %>%
+  group_by(Insurance_status) %>%
+  summarise(
+    n_unweighted = sum(adequate_ldl_control2, na.rm = TRUE),
+    N_unweighted = n(),
+    .groups = "drop"
+  )
+
+# raw N with weighted percentages
+final_summary <- summary_stats %>%
+  as.data.frame() %>%
+  left_join(raw_counts, by = "Insurance_status") %>%  
+  rowwise() %>%
+  mutate(
+    Percent = round(adequate_ldl_control2 * 100, 1),
+    `Adequate BP control (n/N, %)` = paste0(
+      n_unweighted, "/", N_unweighted, " (", Percent, "%)"
+    )
+  ) %>%
+  ungroup() %>%
+  select(Insurance_status, `Adequate BP control (n/N, %)`) 
+print(final_summary)
+
+chi_sq_test <- svychisq(
+    ~adequate_ldl_control2 + Insurance_status,
+    design = svy_design
+  )
+chi_sq_test$p.value
+
+```
+
+```{r}
+
+svy_design_st2 <- svydesign(
+  ids = ~SDMVPSU,
+  strata = ~SDMVSTRA,   
+  weights = ~weight.fasting,
+  data = all3_ex12,  
+  nest = TRUE
+)
+
+svy_design <- update(svy_design_st2, PIR_cate = as.factor(PIR_cate))
+svy_design <- subset(svy_design, DM.doc==1) 
+svy_design <- subset(svy_design, cycle==66|cycle==12) #only 2017-2023
+
+  
+summary_stats <- svyby(
+  ~adequate_ldl_control2,
+  by = ~PIR_cate,
+  design = svy_design,
+  svymean,
+  na.rm = TRUE
+)
+  
+raw_counts <- all3_ex12 %>%
+  filter(DM.doc == 1 & cycle==66) %>%
+  group_by(PIR_cate) %>%
+  summarise(
+    n_unweighted = sum(adequate_ldl_control2, na.rm = TRUE),
+    N_unweighted = n(),
+    .groups = "drop"
+  )
+
+# raw N with weighted percentages
+final_summary <- summary_stats %>%
+  as.data.frame() %>%
+  left_join(raw_counts, by = "PIR_cate") %>%  
+  rowwise() %>%
+  mutate(
+    Percent = round(adequate_ldl_control2 * 100, 1),
+    `Adequate BP control (n/N, %)` = paste0(
+      n_unweighted, "/", N_unweighted, " (", Percent, "%)"
+    )
+  ) %>%
+  ungroup() %>%
+  select(PIR_cate, `Adequate BP control (n/N, %)`) 
+print(final_summary)
+
+chi_sq_test <- svychisq(
+    ~adequate_ldl_control2 + PIR_cate,
+    design = svy_design
+  )
+chi_sq_test$p.value
+
+```
+
+
+
+# Supp. Table 10: Secular trends in diabetes treatment among people with diabetes and a presumptive indication for treatment. Secular trends in use of medications for treatment of diabetes, among participants with diabetes with presumptive indication for therapy, defined as hemoglobin A1c ≥ 7% or receiving therapy. 
+# P-values here were not used. We used p values from Joinpoint Software instead.
+```{r}
+all3_dmallex12.2 <- all3 %>% filter(cycle!=12 & DM.all==1 & (HBA1C >= 7|Any_diabetes_drug == 1))
+
+# Define survey design
+svy_design_st2 <- svydesign(
+  ids = ~SDMVPSU,
+  strata = ~SDMVSTRA,   
+  weights = ~weight.fasting,
+  data = all3_dmallex12.2,  
+  nest = TRUE
+)
+
+svy_design <- update(svy_design_st2)
+
+
+# Compute raw N
+raw_counts <- all3_dmallex12.2 %>%
+  group_by(cycle_label_numeric) %>%
+  summarise(
+    N_unweighted = n(),
+    across(c(Any_diabetes_drug, METF, SU, SGLT2, GLP1, INSULIN, TZD, DPP4, other), 
+           ~sum(.), .names = "{.col}_raw"),
+    .groups = "drop"
+  )
+
+# Compute weighted percentages 
+weighted_stats <- svyby(
+  ~ Any_diabetes_drug + METF + SU + SGLT2 + GLP1 + INSULIN + TZD + DPP4 + other,
+  by = ~ cycle_label_numeric,
+  design = svy_design,
+  FUN = svymean ,
+  na.rm = TRUE
+)
+
+# Compute p-values
+p_values <- lapply(c("Any_diabetes_drug", "METF", "SU", "SGLT2", "GLP1", "INSULIN", "TZD", "DPP4", "other"), function(var) {
+  model <- svyglm(as.formula(paste0(var, " ~ cycle_label_numeric")), design = svy_design, family = binomial())
+  p_val <- summary(model)$coefficients[2, 4]
+  data.frame(variable = var, p_value = p_val)
+}) %>% bind_rows() 
+
+p_values_transposed <- p_values %>%
+  pivot_wider(names_from = "variable", values_from = "p_value") %>%
+  mutate(cycle_label_numeric = "P-value") %>% 
+  mutate(cycle_label_numeric = as.character(cycle_label_numeric))
+
+
+final_table <- lapply(c("Any_diabetes_drug", "METF", "SU", "SGLT2", "GLP1", "INSULIN", "TZD", "DPP4", "other"), function(var) {
+  weighted_stats %>%
+  left_join(raw_counts, by = c("cycle_label_numeric")) %>%
+  mutate(cycle_label_numeric = as.character(cycle_label_numeric)) %>% 
+  bind_rows(p_values_transposed) %>% 
+  mutate(
+    !!var:= paste0(get(paste0(var,"_raw")), "/", N_unweighted, " (", round(get(var) * 100, 1), "%)")) } %>% 
+    select( var)) 
+final_table <- as.data.frame(final_table)
+
+
+```
+
+#Supp. Table 11: Joinpoint analysis of participants with diagnosed diabetes and presumptive indication for treatment.
+# P-values here were not used. We used p values from Joinpoint Software instead.
+```{r}
+
+all3_dmdocex12.2 <- all3 %>% filter(cycle!=12 & DM.doc==1 & (HBA1C >= 7|Any_diabetes_drug == 1))
+
+# Define survey design
+svy_design_st2 <- svydesign(
+  ids = ~SDMVPSU,
+  strata = ~SDMVSTRA,   
+  weights = ~weight.fasting,
+  data = all3_dmdocex12.2,  
+  nest = TRUE
+)
+
+svy_design <- update(svy_design_st2)
+
+
+# Compute raw N
+raw_counts <- all3_dmdocex12.2 %>%
+  group_by(cycle_label_numeric) %>%
+  summarise(
+    N_unweighted = n(),
+    across(c(Any_diabetes_drug, METF, SU, SGLT2, GLP1, INSULIN, TZD, DPP4, other), 
+           ~sum(.), .names = "{.col}_raw"),
+    .groups = "drop"
+  )
+
+# Compute weighted percentages 
+weighted_stats <- svyby(
+  ~ Any_diabetes_drug + METF + SU + SGLT2 + GLP1 + INSULIN + TZD + DPP4 + other,
+  by = ~ cycle_label_numeric,
+  design = svy_design,
+  FUN = svymean ,
+  na.rm = TRUE
+)
+
+# Compute p-values
+p_values <- lapply(c("Any_diabetes_drug", "METF", "SU", "SGLT2", "GLP1", "INSULIN", "TZD", "DPP4", "other"), function(var) {
+  model <- svyglm(as.formula(paste0(var, " ~ cycle_label_numeric")), design = svy_design, family = binomial())
+  p_val <- summary(model)$coefficients[2, 4]
+  data.frame(variable = var, p_value = p_val)
+}) %>% bind_rows() 
+
+p_values_transposed <- p_values %>%
+  pivot_wider(names_from = "variable", values_from = "p_value") %>%
+  mutate(cycle_label_numeric = "P-value") %>% 
+  mutate(cycle_label_numeric = as.character(cycle_label_numeric))
+
+
+final_table <- lapply(c("Any_diabetes_drug", "METF", "SU", "SGLT2", "GLP1", "INSULIN", "TZD", "DPP4", "other"), function(var) {
+  weighted_stats %>%
+  left_join(raw_counts, by = c("cycle_label_numeric")) %>%
+  mutate(cycle_label_numeric = as.character(cycle_label_numeric)) %>% 
+  bind_rows(p_values_transposed) %>% 
+  mutate(
+    !!var:= paste0(get(paste0(var,"_raw")), "/", N_unweighted, " (", round(get(var) * 100, 1), "%)")) } %>% 
+    select( var)) 
+final_table <- as.data.frame(final_table)
+
+
+```
+
+
+#Supp. Table 12: Predictors of use of medications for diabetes treatment.
+```{r}
+all3_doc66 <- all3%>% filter(DM.doc==1 & cycle==66) #diagnosed diabetes
+all3_all66 <- all3 %>% filter(DM.all==1 & cycle==66) #any diabetes
+all3_all66.2 <- all3 %>% filter(cycle==66 & DM.all==1 & (HBA1C >= 7|Any_diabetes_drug == 1)) #with diabetes and a presumptive indication for treatment
+
+```
+
+```{r}
+generate_survey_table <- function(data, grouping_var) {
+  
+  # Define survey design
+  svy_design_st2 <- svydesign(
+    ids = ~SDMVPSU,
+    strata = ~SDMVSTRA,   
+    weights = ~weight.fasting,
+    data = data,  
+    nest = TRUE
+  )
+  
+  svy_design <- update(svy_design_st2)
+  
+  # Compute raw N
+  raw_counts <- data %>%
+    group_by(.data[[grouping_var]]) %>%
+    summarise(
+      N_unweighted = n(),
+      across(c(Any_diabetes_drug, METF, SU, SGLT2, GLP1, INSULIN, TZD, DPP4, other), 
+             ~sum(.), .names = "{.col}_raw"),
+      .groups = "drop"
+    )
+  
+  # Compute weighted percentages 
+  weighted_stats <- svyby(
+    ~ Any_diabetes_drug + METF + SU + SGLT2 + GLP1 + INSULIN + TZD + DPP4 + other,
+    by = as.formula(paste0("~", grouping_var)),
+    design = svy_design,
+    FUN = svymean,
+    na.rm = TRUE
+  )
+  
+  # Compute p-values
+  p_values <- lapply(c("Any_diabetes_drug", "METF", "SU", "SGLT2", "GLP1", "INSULIN", "TZD", "DPP4", "other"), function(var) {
+    test <- svychisq(as.formula(paste0("~", var, " + ", grouping_var)), design = svy_design)
+    data.frame(variable = var, p_value = test$p.value)
+  }) %>% bind_rows()
+  
+  p_values_transposed <- p_values %>%
+    pivot_wider(names_from = "variable", values_from = "p_value") %>%
+    mutate(!!grouping_var := "P-value") %>% 
+    mutate(!!grouping_var := as.character(.data[[grouping_var]]))
+  
+  final_table <- lapply(c("Any_diabetes_drug", "METF", "SU", "SGLT2", "GLP1", "INSULIN", "TZD", "DPP4", "other"), function(var) {
+    weighted_stats %>%
+    left_join(raw_counts, by = c(grouping_var)) %>%
+    mutate(!!grouping_var := as.character(.data[[grouping_var]])) %>% 
+    bind_rows(p_values_transposed) %>% 
+    mutate(
+      !!var := paste0(.data[[paste0(var,"_raw")]], "/", N_unweighted, " (", round(.data[[var]] * 100, 1), "%)")
+    ) %>%
+    select(, !!var) 
+  })
+  
+  final_table <- as.data.frame(final_table)
+  return(list(final_table = final_table, p_values_transposed = p_values_transposed))
+}
+
+result <- generate_survey_table(all3_doc66, "sex")
+result <- generate_survey_table(all3_doc66, "race4")
+result <- generate_survey_table(all3_doc66, "birthcountry")
+result <- generate_survey_table(all3_doc66, "education")
+result <- generate_survey_table(all3_doc66, "Insurance_status")
+result <- generate_survey_table(all3_doc66, "PIR_cate")
+
+result <- generate_survey_table(all3_all66, "sex")
+result <- generate_survey_table(all3_all66, "race4")
+result <- generate_survey_table(all3_all66, "birthcountry")
+result <- generate_survey_table(all3_all66, "education")
+result <- generate_survey_table(all3_all6, "Insurance_status")
+result <- generate_survey_table(all3_all66, "PIR_cate")
+
+
+result <- generate_survey_table(all3_all66.2, "sex")
+result <- generate_survey_table(all3_all66.2, "race4")
+result <- generate_survey_table(all3_all66.2, "birthcountry")
+result <- generate_survey_table(all3_all66.2, "education")
+result <- generate_survey_table(all3_all66.2, "Insurance_status")
+result <- generate_survey_table(all3_all66.2, "PIR_cate")
+
+```
+
+
+#calcualte 95% CI
+```{r}
+#a = all3_dmdoc %>% filter(sex=="Male")
+  svy_design <- svydesign(
+    ids = ~SDMVPSU,
+    strata = ~SDMVSTRA, 
+    weights = ~weight.fasting,
+    data = a,
+    nest = TRUE
+  )
+  
+  srvyr_design <- as_survey_design(svy_design)
+  
+  # Calculate prevalence
+  prevalence_data <- srvyr_design %>%
+    group_by(cycle_label) %>%
+    summarize(
+      HBA1C1 = survey_mean(HBA1C_cate7, vartype = "ci", proportion = TRUE) * 100
+    ) %>%
+    ungroup()
+```
+

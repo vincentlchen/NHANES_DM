@@ -1,0 +1,527 @@
+---
+title: "merged data"
+author: "Miaojin Hu"
+date: "2024-09-01"
+output: pdf_document
+---
+
+```{r}
+library(doParallel)
+library(foreach)
+library(dplyr)
+library(haven)
+```
+
+#import demographic info
+```{r}
+num_cores <- detectCores()
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+file_names <- paste0("demo_", LETTERS[1:11], ".xpt")
+file_paths <- file.path("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Demographic", file_names)
+common_vars <- c("SEQN", "SDDSRVYR", "RIDAGEYR", "RIAGENDR", "DMDEDUC2", "RIDRETH1")
+
+demo_combined <- foreach(file = file_paths, .combine = bind_rows, .packages = c("haven", "dplyr")) %dopar% {
+  demo <- read_xpt(file) %>%
+    select(all_of(common_vars))
+  
+  if (grepl("demo_J", file)) {
+    demo <- demo %>%
+      bind_cols (read_xpt(file) %>%
+      select(WTINTPRP, WTMECPRP, RIDRETH3, DMDBORN4) %>% 
+      rename(DMDBORN = DMDBORN4))
+  } else if (grepl("demo_[A-I]", file)){
+    demo <- demo %>%
+      bind_cols(read_xpt(file) %>%
+      select(WTINT2YR, WTMEC2YR, DMDHHSIZ))
+  }
+  else{
+    demo <- demo %>% 
+      bind_cols(read_xpt(file) %>%
+      select(WTINT2YR, WTMEC2YR, RIDRETH3, DMDHHSIZ, DMDBORN4) %>% 
+      rename(DMDBORN = DMDBORN4))
+  }
+  if (grepl("demo_[G-I]", file)) {
+    demo <- demo %>%
+      bind_cols( read_xpt(file) %>%
+      select(RIDRETH3, DMDBORN4, INDHHIN2) %>% 
+      rename(DMDBORN = DMDBORN4))
+  } 
+  if (grepl("demo_[A-D]", file)) {
+    demo <- demo %>%
+      bind_cols(read_xpt(file) %>%
+      select(DMDBORN, INDHHINC))
+  } 
+  if (grepl("demo_[E-F]", file)) {
+    demo <- demo %>%
+      bind_cols(read_xpt(file) %>%
+      select(DMDBORN2, INDHHIN2) %>% 
+      rename(DMDBORN = DMDBORN2))
+  }
+  
+  demo
+} 
+stopCluster(cl)
+saveRDS(demo_combined, "D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Demographic//demo_combined.rds")
+```
+
+
+#import Examination info
+```{r}
+num_cores <- detectCores()
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+BMX_names <- paste0("BMX_", LETTERS[1:11], ".xpt")
+BMX_paths <- file.path("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Examination", BMX_names)
+
+BMX_combined <- foreach(file = BMX_paths, .combine = bind_rows, .packages = c("haven", "dplyr")) %dopar% {
+  BMX <- read_xpt(file) %>%
+    select(SEQN, BMXWT, BMXHT, BMXBMI, BMXWAIST)
+} 
+
+BPX_names <- paste0("BPX_", LETTERS[1:11], ".xpt")
+BPX_paths <- file.path("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Examination", BPX_names)
+
+BPX_combined <- foreach(file = BPX_paths, .combine = bind_rows, .packages = c("haven", "dplyr")) %dopar% {
+  if (grepl("BPX_[J-K]", file)) {
+    BPX <- read_xpt(file) %>%
+    select(SEQN, BPXOSY1:BPXOSY3, BPXODI1:BPXODI3) %>% 
+      rename_with(~ gsub("BPXOSY", "BPXSY", .x), starts_with("BPXOSY")) %>% 
+      rename_with(~ gsub("BPXODI", "BPXDI", .x), starts_with("BPXODI"))
+  
+  } else {
+    BPX <- read_xpt(file) %>%
+    select(SEQN, BPXSY1:BPXSY4, BPXDI1:BPXDI4)
+  }
+  
+} 
+stopCluster(cl)
+BPX_combined <- BPX_combined %>% select(-BPAEN1, -BPAEN2, -BPAEN3)
+
+exam_combined = merge(BPX_combined, BMX_combined, by = "SEQN",  all.x = TRUE, all.y = TRUE)
+
+saveRDS(exam_combined, "D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Examination//exam_combined.rds")
+exam_combined = readRDS("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Examination//exam_combined.rds")
+
+#extract BPQ020
+BPQ_names <- paste0("BPQ_", LETTERS[1:11], ".xpt")
+BPQ_paths <- file.path("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Questionnaire", BPQ_names)
+
+BPQ_combined <- foreach(file = BPQ_paths, .combine = bind_rows, .packages = c("haven", "dplyr")) %dopar% {
+  BMX <- read_xpt(file) %>%
+    select(SEQN, BPQ020)
+} 
+
+```
+
+# import laboratory info
+```{r}
+num_cores <- detectCores()
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+
+#1999-2000 total cholesterol and HDL
+TCHOL_1 <- read_xpt("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Laboratory//Lab13_A.XPT") %>% 
+  select(SEQN, LBXTC, LBDHDL)
+
+#2001-2002 total cholesterol and HDL
+TCHOL_2 <- read_xpt("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Laboratory//l13_b.XPT") %>% 
+  select(SEQN, LBXTC, LBDHDL)
+
+#2003-2004 total cholesterol and HDL
+TCHOL_3 <- read_xpt("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Laboratory//l13_c.XPT") %>% 
+  select(SEQN, LBXTC, LBXHDD) %>% 
+  rename(LBDHDL = LBXHDD)
+
+TCHOL_names <- paste0("TCHOL_", LETTERS[4:11], ".xpt")
+TCHOL_paths <- file.path("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Laboratory", TCHOL_names)
+
+TCHOL_combined <- foreach(file = TCHOL_paths, .combine = bind_rows, .packages = c("haven", "dplyr")) %dopar% {
+  TCHOL <- read_xpt(file) %>%
+    select(SEQN, LBXTC)
+} 
+
+file_names <- paste0("HDL_", LETTERS[4:11], ".xpt")
+file_paths <- file.path("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Laboratory", file_names)
+
+HDL_combined <- foreach(file = file_paths, .combine = bind_rows, .packages = c("haven", "dplyr")) %dopar% {
+  HDL <- read_xpt(file) %>%
+    select(SEQN, LBDHDD) %>% 
+    rename(LBDHDL = LBDHDD)
+} 
+
+#stopCluster(c1)
+
+TC_HDL <-  merge(TCHOL_combined, HDL_combined, by = "SEQN", all.x = TRUE, all.y = TRUE)
+TC_HDL <-  rbind(TCHOL_1, TCHOL_2, TCHOL_3, TC_HDL)
+
+# LDL cycle 12 doesn't have LDL and Triglyceride
+LDL <-  read_xpt("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Laboratory//LAB13AM_A.XPT") %>% 
+  select(SEQN, LBDLDL, LBXTR)
+
+LDL <- LDL %>% 
+  rbind(read_xpt("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Laboratory//L13AM_B.XPT") %>% 
+  select(SEQN, LBDLDL, LBXTR)
+)
+
+LDL <- LDL %>% 
+  rbind(read_xpt("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Laboratory//L13AM_C.XPT") %>% 
+  select(SEQN, LBDLDL, LBXTR)
+)
+
+file_names <- paste0("TRIGLY_", LETTERS[4:10], ".xpt")
+file_paths <- file.path("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Laboratory", file_names)
+
+LDL_TRI <- foreach(file = file_paths, .combine = bind_rows, .packages = c("haven", "dplyr")) %dopar% {
+  TRIGLY <- read_xpt(file) %>%
+    select(SEQN, LBDLDL, LBXTR) 
+} 
+
+LDL_TRI = rbind(LDL, LDL_TRI)
+
+# Glycohemoglobin(%)
+ghb <-  read_xpt("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Laboratory//LAB10_A.XPT") %>% 
+  select(SEQN, LBXGH)
+
+ghb <- ghb %>% 
+  rbind(read_xpt("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Laboratory//L10_B.XPT") %>% 
+  select(SEQN, LBXGH)
+)
+
+ghb <- ghb %>% 
+  rbind(read_xpt("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Laboratory//L10_C.XPT") %>% 
+  select(SEQN, LBXGH)
+)
+
+file_names <- paste0("GHB_", LETTERS[4:11], ".xpt")
+file_paths <- file.path("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Laboratory", file_names)
+
+GHB_com <- foreach(file = file_paths, .combine = bind_rows, .packages = c("haven", "dplyr")) %dopar% {
+  GHB <- read_xpt(file) %>%
+    select(SEQN, LBXGH) 
+} 
+ghb = rbind(ghb,GHB_com)
+
+# plasma glucose
+glu <-  read_xpt("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Laboratory//LAB10AM_A.XPT") %>% 
+  select(SEQN, WTSAF2YR, LBXGLU, LBXIN)
+
+glu <- glu %>% 
+  rbind(read_xpt("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Laboratory//L10AM_B.XPT") %>% 
+  select(SEQN, WTSAF2YR, LBXGLU, LBXIN)
+)
+
+glu <- glu %>% 
+  rbind(read_xpt("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Laboratory//L10AM_C.XPT") %>% 
+  select(SEQN, WTSAF2YR, LBXGLU, LBXIN)
+)
+
+file_names <- paste0("GLU_", LETTERS[4:11], ".xpt")
+file_paths <- file.path("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Laboratory", file_names)
+
+glu_com <- foreach(file = file_paths, .combine = bind_rows, .packages = c("haven", "dplyr")) %dopar% {
+   if (grepl("GLU_J", file)) {
+    glu <- read_xpt(file) %>%
+    select(SEQN, WTSAFPRP, LBXGLU) 
+  } else if (grepl("GLU_[D-G]", file)) {
+    glu <- read_xpt(file) %>%
+    select(SEQN, WTSAF2YR, LBXGLU, LBXIN) 
+  } else {
+    glu <- read_xpt(file) %>%
+    select(SEQN, WTSAF2YR, LBXGLU)
+  }
+} 
+
+
+file_names <- paste0("INS_", LETTERS[8:11], ".xpt")
+file_paths <- file.path("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Laboratory", file_names)
+
+ins <- foreach(file = file_paths, .combine = bind_rows, .packages = c("haven", "dplyr")) %dopar% {
+   ins <- read_xpt(file) %>%
+    select(SEQN,LBXIN) 
+} 
+
+
+glu_ins <-  bind_rows(glu, glu_com)
+
+glu_ins <- glu_ins %>% 
+  full_join(ins, by = "SEQN", suffix = c("_df1", "_df2")) %>%
+  mutate(LBXIN = coalesce(LBXIN_df1, LBXIN_df2)) %>%
+  select(-LBXIN_df1, -LBXIN_df2)
+
+lab_combined <-  TC_HDL %>% full_join(LDL_TRI, by = "SEQN") %>% 
+  full_join(ghb, by = "SEQN") %>% 
+  full_join(glu_ins, by = "SEQN")
+
+
+# import biopro related vars
+num_cores <- detectCores()
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+
+file_names <- paste0("BIOPRO_", LETTERS[1:10], ".xpt")
+file_paths <- file.path("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Laboratory", file_names)
+
+BIOPRO_combined <- foreach(file = file_paths, .combine = bind_rows, .packages = c("haven", "dplyr")) %dopar% {
+  BIOPRO <- read_xpt(file) 
+  if ("LBDSTB" %in% names(BIOPRO)) {
+    BIOPRO <- BIOPRO %>% rename(LBXSTB = LBDSTB,
+                                LBXSAPSI = LBDSAPSI)
+  }
+    BIOPRO <- BIOPRO %>% 
+      select(SEQN, LBXSATSI, LBXSASSI, LBXSTB, LBXSAPSI, LBXSAL) 
+} 
+
+#stopCluster(c1)
+
+#import CBC
+
+num_cores <- detectCores()
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+
+file_names <- paste0("CBC_", LETTERS[1:11], ".xpt")
+file_paths <- file.path("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Laboratory", file_names)
+
+CBC_combined <- foreach(file = file_paths, .combine = bind_rows, .packages = c("haven", "dplyr")) %dopar% {
+  CBC <- read_xpt(file)  %>% 
+      select(SEQN, LBXPLTSI, LBXHGB, LBXWBCSI) 
+} 
+
+#stopCluster(c1)
+
+lab_combined <- lab_combined %>% full_join(CBC_combined, by = "SEQN") %>% 
+  full_join(BIOPRO_combined, by = "SEQN")
+
+#saveRDS(lab_combined, "D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Laboratory//lab_combined.rds")
+
+
+#import TSH, T4 not include yet
+
+letters <- c("A", "B", "E", "F", "G")
+file_names <- paste0("THYROD_", letters, ".xpt")
+file_paths <- file.path("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Laboratory", file_names)
+
+THYROD_combined <- foreach(file = file_paths, .combine = bind_rows, .packages = c("haven", "dplyr")) %dopar% {
+  THYROD <- read_xpt(file) 
+  if (("LBXTSH1" %in% names(THYROD))|("LBXTT4" %in% names(THYROD))) {
+    THYROD <- THYROD %>% rename(LBXTSH = LBXTSH1,
+                                LBXT4 = LBXTT4)
+  }
+    THYROD <- THYROD %>% 
+      select(SEQN, LBXTSH, LBXT4) 
+} 
+
+lab_combined <- lab_combined %>% full_join(THYROD_combined, by = "SEQN")
+
+saveRDS(lab_combined, "D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Laboratory//lab_combined.rds")
+
+```
+
+# import alcohol
+```{r}
+num_cores <- detectCores()
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+file_names <- paste0("ALQ_", LETTERS[1:11], ".xpt")
+file_paths <- file.path("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Questionnaire", file_names)
+
+alq_combined <- foreach(file = file_paths, .combine = bind_rows, .packages = c("haven", "dplyr")) %dopar% {
+  
+  if (grepl("ALQ_A", file)) {
+    alq <- read_xpt(file) %>%
+      select(SEQN, ALQ130, ALQ100, ALQ110, ALQ120Q, ALQ120U, ALQ140Q, ALQ140U) %>% 
+      rename(ALQ101 = ALQ100)
+  } else if (grepl("ALQ_B", file)){
+    alq <- read_xpt(file) %>%
+      select(SEQN, ALQ130, ALD100, ALQ110, ALQ120Q, ALQ120U, ALQ140Q, ALQ140U) %>% 
+      rename(ALQ101 = ALD100)
+  } else if (grepl("ALQ_[C-F]", file)){
+    alq <- read_xpt(file) %>%
+      select(SEQN, ALQ130, ALQ101, ALQ110, ALQ120Q, ALQ120U, ALQ140Q, ALQ140U)
+  } else if (grepl("ALQ_[G-I]", file)){
+    alq <- read_xpt(file) %>%
+      select(SEQN, ALQ130, ALQ101, ALQ110, ALQ120Q, ALQ120U, ALQ141Q, ALQ141U)
+  } else if (grepl("ALQ_[J-K]", file)){
+    alq <- read_xpt(file) %>%
+      select(SEQN, ALQ111, ALQ121, ALQ130, ALQ142)
+  }
+  
+  alq
+} 
+stopCluster(cl)
+
+saveRDS(alq_combined, "D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Questionnaire//alq_combined.rds")
+```
+
+#import diabetes
+```{r}
+num_cores <- detectCores()
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+file_names <- paste0("DIQ_", LETTERS[1:11], ".xpt")
+file_paths <- file.path("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Questionnaire", file_names)
+
+diq_combined <- foreach(file = file_paths, .combine = bind_rows, .packages = c("haven", "dplyr")) %dopar% {
+  
+  if (grepl("DIQ_A", file)) {
+    diq <- read_xpt(file) %>%
+      select(SEQN, DIQ010, DIQ040Q, DIQ050, DIQ060Q, DIQ060U, DIQ070, DIQ080) %>% 
+      rename(DID040 = DIQ040Q, 
+             DID060 = DIQ060Q)
+  } else if (grepl("DIQ_[B-C]", file)){
+    diq <- read_xpt(file) %>%
+      select(SEQN, DIQ010, DID040Q, DIQ050, DID060Q, DIQ060U, DIQ070, DIQ080) %>% 
+      rename(DID040 = DID040Q,
+             DID060 = DID060Q)
+  } else if (grepl("DIQ_[D-E]", file)){
+   diq <- read_xpt(file) %>%
+      select(SEQN, DIQ010, DID040, DIQ050, DID060, DIQ060U, DID070, DIQ080) %>% 
+      rename(DIQ070 = DID070)
+  } else if (grepl("DIQ_[F-J]", file)){
+   diq <- read_xpt(file) %>%
+      select(SEQN, DIQ010, DID040, DIQ050, DID060, DIQ060U, DIQ070, DIQ080)
+  } else if (grepl("DIQ_K", file)){
+   diq <- read_xpt(file) %>%
+      select(SEQN, DIQ010, DID040, DIQ050, DID060, DIQ060U, DIQ070)
+  } 
+  diq
+  
+} 
+stopCluster(cl)
+
+saveRDS(diq_combined, "D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Questionnaire//diq_combined.rds")
+```
+
+#import tobacco
+```{r}
+num_cores <- detectCores()
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+file_names <- paste0("SMQ_", LETTERS[1:11], ".xpt")
+file_paths <- file.path("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Questionnaire", file_names)
+
+smq_combined <- foreach(file = file_paths, .combine = bind_rows, .packages = c("haven", "dplyr")) %dopar% {
+  
+  if (grepl("SMQ_A", file)) {
+    smq <- read_xpt(file) %>%
+      select(SEQN, SMQ020, SMD030, SMQ040, SMD070, SMD055, SMD057) %>% 
+      rename(SMQ720 = SMD070)
+  } else if (grepl("SMQ_[B-I]", file)){
+    smq <- read_xpt(file) %>%
+      select(SEQN, SMQ020, SMD030, SMQ040, SMD055, SMD057) 
+  } else if (grepl("SMQ_J", file)){
+   smq <- read_xpt(file) %>%
+      select(SEQN, SMQ020, SMD030, SMQ040, SMQ050Q, SMQ050U, SMD057) 
+  } else if (grepl("SMQ_K", file)){
+   smq <- read_xpt(file) %>%
+      select(SEQN, SMQ020, SMQ040) 
+  } 
+  smq
+  
+} 
+
+smq2 = read_xpt("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Questionnaire//SMQMEC_B.xpt") %>% 
+  select(SEQN, SMQ720)
+smq2 = smq2 %>% rbind(read_xpt("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Questionnaire//SMQMEC_C.xpt") %>% 
+                        select(SEQN, SMQ720))
+
+file_names <- paste0("SMQRTU_", LETTERS[4:11], ".xpt")
+file_paths <- file.path("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Questionnaire", file_names)
+
+smq_3 <- foreach(file = file_paths, .combine = bind_rows, .packages = c("haven", "dplyr")) %dopar% {
+    smq <- read_xpt(file) %>%
+      select(SEQN, SMQ720) 
+  
+} 
+stopCluster(cl)
+
+smq2 = rbind(smq2, smq_3)
+
+
+smq_combined <- smq_combined %>% 
+  full_join(smq2, by = "SEQN", suffix = c("_df1", "_df2")) %>%
+  mutate(SMQ720 = coalesce(SMQ720_df1, SMQ720_df2)) %>%
+  select(-SMQ720_df1, -SMQ720_df2)
+
+saveRDS(smq_combined, "D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Questionnaire//smq_combined.rds")
+  
+```
+
+# import medical prescription
+```{r}
+num_cores <- detectCores()
+cl <- makeCluster(num_cores)
+registerDoParallel(cl)
+
+rxq_combined <- read_xpt("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Questionnaire//RXQ_RX_A.XPT") %>%
+      select(SEQN, RXD030, RXD240B) %>% 
+  rbind(read_xpt("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Questionnaire//RXQ_RX_B.XPT") %>%
+      select(SEQN, RXD030,RXD240B)) %>% 
+  rename(RXDDRUG = RXD240B,
+         RXDUSE = RXD030)
+
+file_names <- paste0("RXQ_RX_", LETTERS[3:10], ".xpt")
+file_paths <- file.path("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Questionnaire", file_names)
+
+rxq1 <- foreach(file = file_paths, .combine = bind_rows, .packages = c("haven", "dplyr")) %dopar% {
+  rxq <- read_xpt(file) %>%
+      select(SEQN, RXDUSE, RXDDRUG)
+} 
+
+rxq2 <- read_xpt("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Questionnaire//RXQ_RX_K.XPT") %>%
+      select(SEQN, RXQ033) %>% 
+      rename(RXDUSE = RXQ033)
+
+stopCluster(cl)
+
+rxq_combined = rbind(rxq_combined, rxq1)
+rxq_combined = bind_rows(rxq_combined, rxq2)
+
+saveRDS(rxq_combined, "D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Questionnaire//rxq_combined.rds")
+
+```
+
+# Liver ultrasound transient elastography
+
+#```{r}
+lux <- read_xpt("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Examination//P_LUX.XPT") %>%
+  select(SEQN, LUAXSTAT, LUARXNC, LUARXND, LUARXIN, LUAPNME, LUANMVGP, LUANMTGP, LUXSMED, LUXSIQR, LUXSIQRM,LUXCAPM, LUXCPIQR) %>% 
+  rename(VCTE.status = LUAXSTAT,
+         VCTE.partial = LUARXNC,
+         VCTE.probE = LUAPNME,
+         VCTE.count.complete = LUANMVGP,
+         VCTE.count.attempted = LUANMTGP,
+         LSM = LUXSMED,
+         LSM.iqr = LUXSIQR,
+         LSM.iqr.med = LUXSIQRM,
+         CAP = LUXCAPM,
+         CAP.iqr = LUXCPIQR)
+
+lux2 <- read_xpt("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Examination//LUX_L.XPT") %>%
+  select(SEQN, LUAXSTAT, LUARXNC, LUARXND, LUARXIN, LUAPNME, LUANMVGP, LUANMTGP, LUXSMED, LUXSIQR, LUXSIQRM,LUXCAPM, LUXCPIQR) %>% 
+  rename(VCTE.status = LUAXSTAT,
+         VCTE.partial = LUARXNC,
+         VCTE.probE = LUAPNME,
+         VCTE.count.complete = LUANMVGP,
+         VCTE.count.attempted = LUANMTGP,
+         LSM = LUXSMED,
+         LSM.iqr = LUXSIQR,
+         LSM.iqr.med = LUXSIQRM,
+         CAP = LUXCAPM,
+         CAP.iqr = LUXCPIQR)
+
+lux <- rbind(lux, lux2)
+saveRDS(lux, "D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Examination//lux.rds")  
+```
+
+
+

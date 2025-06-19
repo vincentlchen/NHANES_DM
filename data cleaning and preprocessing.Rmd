@@ -1,0 +1,444 @@
+---
+title: "merged_data2"
+author: "Miaojin Hu"
+date: "2024-09-02"
+output: pdf_document
+---
+```{r}
+library(doParallel)
+library(foreach)
+library(dplyr)
+library(haven)
+library(data.table)
+library(tidyr)
+```
+
+#load all processed files
+```{r}
+demo_combined <- readRDS("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Demographic//demo_combined.rds")
+exam_combined <- readRDS("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Examination//exam_combined.rds")
+lab_combined <- readRDS("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Laboratory//lab_combined.rds")
+alq_combined <- readRDS("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Questionnaire//alq_combined.rds")
+smq_combined <- readRDS("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Questionnaire//smq_combined.rds")
+diq_combined <- readRDS("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Questionnaire//diq_combined.rds")
+rxq_combined <- readRDS("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Questionnaire//rxq_combined.rds")
+lux <- readRDS("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Examination//lux.rds")
+```
+
+#process demo info
+```{r}
+demo_combined <- demo_combined %>% 
+  mutate(ridreth3 = ifelse(is.na(RIDRETH3), RIDRETH1, RIDRETH3),
+         income = coalesce(INDHHIN2, INDHHINC)) %>% 
+  rename(cycle = SDDSRVYR,
+         age = RIDAGEYR,
+         ridreth1 = RIDRETH1,
+         sex = RIAGENDR,
+         birthcountry = DMDBORN,
+         education = DMDEDUC2,
+         household.num = DMDHHSIZ) %>% 
+  select(-INDHHINC, -INDHHIN2, -RIDRETH3) 
+
+#create new weights
+setDT(demo_combined)
+demo_combined <- demo_combined[, `:=`(
+  weight.full = ifelse(cycle == 66, (3.2 / 23.2) * WTINTPRP, WTINT2YR * 2 / 23.2),
+  weight.mec = ifelse(cycle == 66, (3.2 / 23.2) * WTMECPRP, WTMEC2YR * 2 / 23.2)
+)]
+
+#deal with DMBORN recode DMBORN2 to DMBORN
+# 1 in US
+# 2 others
+# 99 don't know
+demo_combined <- demo_combined[, `:=`(
+  birthcountry = ifelse(cycle %in% c(5, 6) & birthcountry %in% c(4, 5), 3, birthcountry)
+)]
+demo_combined <- demo_combined[, `:=`(
+  birthcountry = ifelse(cycle %in% (1:9) & birthcountry %in% c(2, 3), 2, birthcountry)
+)]
+demo_combined<- demo_combined[, `:=`(
+  birthcountry = fifelse(cycle %in% (1:9) & birthcountry == 9 , 99, fifelse(
+    birthcountry == 7 | birthcountry == 77, NA_real_, birthcountry
+  ))
+)]
+
+#deal with income 
+demo_combined <- demo_combined[, `:=`(
+  income = ifelse(cycle >=5 & income %in% c(14, 15), 11, income)
+)]
+
+# age category
+# <30, 30-<40, 40-<50, 50-<60, 60-<70, 70-85, and >= 85
+demo_combined <- demo_combined[, `:=`(
+  age2 = fcase(
+    0 <= age & age < 30 , 1,
+    30 <= age & age < 40, 2,
+    40 <= age & age < 50 , 3,
+    50 <= age & age < 60 , 4,
+    60 <= age & age < 70 , 5,
+    70 <= age & age < 85 , 6,
+    age == 85 , 7,
+    default = NA_real_
+  )
+)]
+```
+
+#process exam info
+```{r}
+setDT(exam_combined)
+exam_combined <- exam_combined[, BPXSAR := rowMeans(.SD, na.rm = TRUE), .SDcols = c("BPXSY1", "BPXSY2", "BPXSY3", "BPXSY4")]
+exam_combined <- exam_combined[, BPXDAR := rowMeans(.SD, na.rm = TRUE), .SDcols = c("BPXDI1", "BPXDI2", "BPXDI3", "BPXDI4")]
+
+```
+
+#process lab info
+```{r}
+setDT(lab_combined)
+lab_combined <- lab_combined %>% 
+  rename(TC = LBXTC,
+         HDL = LBDHDL,
+         LDL = LBDLDL,
+         TG = LBXTR,
+         HBA1C = LBXGH,
+         GLUC = LBXGLU,
+         INS = LBXIN,
+         ALT = LBXSATSI,
+         AST = LBXSASSI,
+         TBil = LBXSTB,
+         ALP = LBXSAPSI,
+         ALB = LBXSAL,
+         count.plt = LBXPLTSI,
+         Hgb = LBXHGB,
+         count.wbc = LBXWBCSI,
+         TSH = LBXTSH,
+         T4 = LBXT4
+         )
+lab_combined <- lab_combined[, `:=`(
+  weight.fasting = coalesce((3.2 / 23.2) * WTSAFPRP, WTSAF2YR * 2 / 23.2)
+)]
+
+```
+
+#process acholic info
+```{r}
+gender_ds <- demo_combined %>% select(SEQN, cycle, sex)
+alq_combined <- merge(alq_combined, gender_ds, by = "SEQN")
+setDT(alq_combined)
+
+#if ALQ101 and ALQ111 is no, then freq = 0
+alq_combined <- alq_combined[, freq := fifelse(ALQ101 == 2 | ALQ111 == 2, 0, NA_integer_)]
+
+#freq monthly unit
+# 4.33 week = 1 month; 1/12 year = 1 month
+alq_combined <- alq_combined[, freq := fifelse(
+  ALQ120U == 1, ALQ120Q * 4.33,                
+  fifelse(ALQ120U == 2, ALQ120Q,                
+          fifelse(ALQ120U == 3, ALQ120Q / 12,   
+                  freq))                    
+)]
+
+alq_combined <- alq_combined[ALQ120Q %in% c(777, 999, 77,99,7777,9999,77777,99999), freq := NA_real_]
+
+alq_combined <- alq_combined[cycle==66|cycle==12, freq := 
+  fcase(
+    ALQ121 == 0, 0,                      # Never in the last year
+    ALQ121 == 1, 30.44,                  # Every day
+    ALQ121 == 2, 25,                     # Nearly every day
+    ALQ121 == 3, 3.5*4.33,               # 3 to 4 times a week
+    ALQ121 == 4, 2*4.33,                 # 2 times a week
+    ALQ121 == 5, 4,                      # Once a week
+    ALQ121 == 6, 2.5,                    # 2 to 3 times a month
+    ALQ121 == 7, 1,                      # Once a month
+    ALQ121 == 8, 0.75,                   # 7 to 11 times in the last year
+    ALQ121 == 9, 0.375,                  # 3 to 6 times in the last year
+    ALQ121 == 10, 0.125,                 # 1 to 2 times in the last year
+    ALQ121 == 77, NA_real_,              # Refused
+    ALQ121 == 99, NA_real_,              # Don't know
+    is.na(ALQ121), NA_real_              # Missing
+  )
+]
+
+# amount
+setDT(alq_combined)
+alq_combined <- alq_combined[, amount := fifelse(ALQ101 == 2 | ALQ111 == 2, 0, NA_integer_)]
+alq_combined <- alq_combined[,amount := ifelse(!is.na(ALQ130) & ALQ130!=99 & ALQ130!=77 &ALQ130!=999 & ALQ130!=777, ALQ130, amount)]
+
+#binge
+alq_combined <- alq_combined[, binge := fifelse(ALQ101 == 2 | ALQ111 == 2, 0, NA_integer_)]
+
+#monthly unit
+# 4.33 week = 1 month; 1/12 year = 1 month
+alq_combined <- alq_combined[cycle >= 1 & cycle <= 6, binge := fifelse(
+  ALQ140U == 1, ALQ140Q * 4.33,                
+  fifelse(ALQ140U == 2, ALQ140Q,                
+          fifelse(ALQ140U == 3, ALQ140Q / 12,   
+                  binge))                    
+)]
+alq_combined <- alq_combined[ALQ140Q %in% c(777, 999, 77,99,7777,9999,77777,99999), binge := NA_real_]
+
+alq_combined <- alq_combined[cycle >= 7 & cycle <= 9, binge := fifelse(
+  ALQ141U == 1, ALQ141Q * 4.33,                
+  fifelse(ALQ141U == 2, ALQ141Q,                
+          fifelse(ALQ141U == 3, ALQ141Q / 12,   
+                  binge))                    
+)]
+alq_combined <- alq_combined[ALQ141Q %in% c(777, 999, 77,99,7777,9999,77777,99999), binge := NA_real_]
+
+alq_combined <- alq_combined[cycle==66|cycle==12, binge := 
+  fcase(
+    ALQ142 == 0, 0,                      # Never in the last year
+    ALQ142 == 1, 30.44,                  # Every day
+    ALQ142 == 2, 25,                     # Nearly every day
+    ALQ142 == 3, 3.5*4.33,               # 3 to 4 times a week
+    ALQ142 == 4, 2*4.33,                 # 2 times a week
+    ALQ142 == 5, 4,                      # Once a week
+    ALQ142 == 6, 2.5,                    # 2 to 3 times a month
+    ALQ142 == 7, 1,                      # Once a month
+    ALQ142 == 8, 0.75,                   # 7 to 11 times in the last year
+    ALQ142 == 9, 0.375,                  # 3 to 6 times in the last year
+    ALQ142 == 10, 0.125,                 # 1 to 2 times in the last year
+    ALQ142 == 77, NA_real_,              # Refused
+    ALQ142 == 99, NA_real_,              # Don't know
+    is.na(ALQ142), NA_real_              # Missing
+  )
+]
+
+#create score
+alq_combined <- alq_combined[, freq_score := 
+  fcase(
+    freq == 0, 0,              #Never
+    freq > 0 & freq < 2, 1,    #Monthly or less
+    freq >= 2 & freq <= 6, 2,  #Two to four times a month
+    freq > 6 & freq < 14, 3,   #Two to three times per week
+    freq >= 14, 4              #Four or more times a week
+  ) 
+]
+
+alq_combined <- alq_combined[, amount_score := 
+  fcase(
+    amount <= 2, 0,                #1 or 2 drinks
+    amount > 2 & amount <=4, 1,    #3 or 4 drinks
+    amount > 4 & amount <=6, 2,    #5 or 6 drinks
+    amount > 6 & amount <=9, 3,    #7 or 9 drinks
+    amount > 9, 4                  #10 or more
+  )
+]
+
+alq_combined <- alq_combined[, binge_score := 
+  fcase(
+    binge == 0, 0,                #Never
+    binge > 0 & binge < 1, 1,    #Less than monthly
+    binge >= 1 & binge < 4, 2,    #Monthly
+    binge >= 4 & binge < 15, 3,   #Weekly
+    binge >= 15, 4                #Four or more times a week
+  ) 
+]
+
+# audic score, differ based on sex
+alq_combined <- alq_combined[, audic_score := freq_score + amount_score + binge_score]
+
+alq_combined <- alq_combined[sex == 1, audic := 
+  fcase(
+  audic_score>=0 & audic_score < 4, 0,     # normal alcohol consumption
+  audic_score>=4 & audic_score < 5, 1,     # alcohol misuse
+  audic_score>=5, 2,                       # alcohol misuse and possible liver damage
+  default = NA
+)]
+alq_combined <- alq_combined[sex == 2, audic := 
+  fcase(
+  audic_score>=0 & audic_score < 3, 0,     # normal alcohol consumption
+  audic_score>=3 & audic_score < 5, 1,     # alcohol misuse
+  audic_score>=5, 2,                       # alcohol misuse and possible liver damage
+  default = NA
+)]
+
+# number of drinks per week
+alq_combined <- alq_combined[, drinks.week := freq * amount / 4.33]
+#sum(!is.na(alq_combined$audic)) #20934
+```
+
+# process diabetes status
+```{r}
+age_ds <- demo_combined %>% select(SEQN, cycle, age)
+setDT(diq_combined)
+
+diq_combined <- merge(diq_combined, age_ds, by = "SEQN")
+
+#DID040: 666 less than 1 year
+diq_combined <- diq_combined[, DID040 := fifelse(DID040 %in% c(777,999, 99999, 9999, 7777, 77777), NA_real_, fifelse(DID040 == 666, age, DID040))]
+
+# deal with #insulin and unit (yearly)
+diq_combined <- diq_combined[, DM.insulin.time := fifelse(
+  DID060 %in% c(777, 999, 7777, 9999, 77777, 99999) | DIQ060U %in% c(7, 9), NA_real_, 
+  fifelse(DID060 == 666, 1/12,              # Less than 1 month: 1/12 of a year
+  fifelse(DIQ060U == 1, DID060 / 12,                         
+          fifelse(DIQ060U == 2, DID060, NA_real_)))         
+)]
+
+
+diq_combined <- diq_combined %>% 
+  rename(DM.doc = DIQ010,
+         DM.age = DID040,
+         DM.insulin = DIQ050,
+         DM.pills = DIQ070,
+         DM.retinopathy = DIQ080)
+#diq_combined %>% filter(DIQ060U == 999|DIQ060U == 777|DIQ060U == 9999|DIQ060U == 7777)
+```
+
+
+# process smoking status
+```{r}
+setDT(smq_combined)
+smq_combined <- merge(smq_combined, age_ds, by = "SEQN")
+smq_combined <- smq_combined[, smoking.status := fcase(
+  SMQ020 == 2, 0,                                # Never smoked
+  SMQ020 == 1 & SMQ040 == 3, 1,                  # Former smoker
+  SMQ020 == 1 & SMQ040 %in% c(1, 2), 2,          # Current smoker
+  default = NA                                   # Assign NA for cases that don't match
+)]
+
+smq_combined <- smq_combined[, `:=`(
+  SMD030 = ifelse(SMD030 %in% c(777, 999, 7777, 9999, 77777, 99999), NA_real_, SMD030),
+  SMQ720 = ifelse(SMQ720 %in% c(777, 999, 7777, 9999, 77777, 99999), NA_real_, SMQ720),
+  SMD055 = ifelse(SMD055 %in% c(777, 999, 7777, 9999, 77777, 99999), NA_real_, SMD055),
+  SMD057 = ifelse(SMD057 %in% c(777, 999, 7777, 9999, 77777, 99999), NA_real_, SMD057)
+)]
+
+smq_combined <- smq_combined[, SMQ050 := fifelse(
+  SMQ050Q %in% c(777, 999, 7777, 9999, 77777, 99999) | SMQ050U %in% c(7, 9), NA_real_,
+                fifelse(SMQ050Q == 66666, 50,          # 50 or more years consider as 50
+                fifelse(SMQ050U == 1, SMQ050Q / 365,   # Convert days to years
+                fifelse(SMQ050U == 2, SMQ050Q / 52,    # Convert weeks to years
+                fifelse(SMQ050U == 3, SMQ050Q / 12,    # Convert months to years
+                fifelse(SMQ050U == 4, SMQ050Q,         
+                NA_real_))))))]                          
+
+smq_combined <- smq_combined[smoking.status==2,smoking.py := (age - SMD030)  * SMQ720 / 20 ]
+
+smq_combined <- smq_combined[smoking.status==0,smoking.py := 0]
+
+smq_combined <- smq_combined[smoking.status==1,smoking.py := ifelse(cycle==66, 
+          (age - SMD030 - SMQ050) * SMD057 / 20, 
+           (SMD055 - SMD030) * SMD057 / 20) ]
+
+#a = smq_combined %>% filter(smoking.py>200)
+smq_combined %>% filter(smoking.py<0)
+# 18 obs smoking.py<0
+# 18 obs smoking.py>200
+```
+
+# process medication usage
+```{r}
+rxq_combined2 <- rxq_combined
+setDT(rxq_combined2)
+rxq_combined2 <- rxq_combined2 %>% 
+  separate_rows(RXDDRUG, sep = ";")
+rxq_combined2$RXDDRUG <- trimws(rxq_combined2$RXDDRUG)
+
+
+medication_cate <- list(
+  Insulin = "insulin",
+  GLP1 = c("lixisenatide","tirzepatide","semaglutide", "liraglutide", "exenatide", "dulaglutide", "albiglutide"),
+  SGLT = "gliflozin",
+  Metformin = "metformin",
+  TZD = "glitazone",
+  SU = c("glyburide", "glipizide", "glimepiride"),
+  DPP4 = c("alogliptin", "linagliptin", "saxagliptin", "sitagliptin"),
+  Alpha_glucosidase = c("acarbose", "miglitol"),
+  BAS = c("colesevelam", "cholestyramine"),
+  Meglitinides = "glinide",
+  Statin = c("rosuvastatin", "atorvastatin", "simvastatin", "pravastatin", "lovastatin", "fluvastatin", "pitavastatin")
+)
+
+#convert all drug name to standard name
+rxq_combined2 <- rxq_combined2 %>%
+  rowwise() %>%
+  mutate(RXDDRUG = case_when(
+    grepl(medication_cate$Insulin, RXDDRUG, ignore.case = TRUE) & !grepl("syringe", RXDDRUG, ignore.case = TRUE) ~ "INSULIN",
+    grepl(paste(medication_cate$GLP1, collapse = "|"), RXDDRUG, ignore.case = TRUE) ~ "GLP1",
+    grepl(medication_cate$SGLT, RXDDRUG, ignore.case = TRUE) ~ "SGLT2",
+    grepl(medication_cate$Metformin, RXDDRUG, ignore.case = TRUE) ~ "METF",
+    grepl(medication_cate$TZD, RXDDRUG, ignore.case = TRUE) ~ "TZD",
+    grepl(paste(medication_cate$SU, collapse = "|"), RXDDRUG, ignore.case = TRUE) ~ "SU",
+    grepl(paste(medication_cate$DPP4, collapse = "|"), RXDDRUG, ignore.case = TRUE) ~ "DPP4",
+    grepl(paste(medication_cate$Alpha_glucosidase, collapse = "|"), RXDDRUG, ignore.case = TRUE) ~ "AGLUC",
+    grepl(paste(medication_cate$BAS, collapse = "|"), RXDDRUG, ignore.case = TRUE) ~ "BAS",
+    grepl(medication_cate$Meglitinides, RXDDRUG, ignore.case = TRUE) ~ "GLINIDE",
+    grepl(paste(medication_cate$Statin, collapse = "|"), RXDDRUG, ignore.case = TRUE) ~ "STATIN",
+    TRUE ~ NA_character_
+  ))
+
+#rxq_combined2 <- rxq_combined2 %>% filter(!is.na(RXDDRUG))
+
+rxq_combined2 <- rxq_combined2 %>%
+  distinct(SEQN, RXDUSE, RXDDRUG) %>% 
+  mutate(value = 1) %>%  #yes 1
+  pivot_wider(names_from = RXDDRUG, values_from = value, values_fill = 0) #no 0
+#119555
+
+saveRDS(rxq_combined2, "D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Questionnaire//rxq_combined2.rds")
+rxq_combined2 = readRDS("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Raw data//Questionnaire//rxq_combined2.rds")
+```
+
+#merge data based on SEQN 63328*116
+```{r}
+all <- demo_combined %>% 
+  inner_join(exam_combined, by = "SEQN") %>% 
+  inner_join(lab_combined, by = "SEQN") %>% 
+  inner_join(alq_combined, by = c("SEQN", "cycle", "sex")) %>% 
+  inner_join(diq_combined, by = c("SEQN", "cycle", "age")) %>% 
+  inner_join(smq_combined, by = c("SEQN", "cycle", "age")) %>% 
+  left_join(lux, by = "SEQN") %>% 
+  inner_join(rxq_combined2, by = "SEQN")
+
+all %>% group_by(cycle) %>% 
+  summarise(count = n())
+
+#all %>% filter(smoking.py < 0)
+
+saveRDS(all, "D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Cleaned data//all.rds") #63328*116 , haven't select specific columns
+all = readRDS("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Cleaned data//all.rds")
+
+all2 <- all %>% 
+  select(-WTINT2YR, -WTINTPRP, -WTMEC2YR, -WTMECPRP, -BPXSY1, -BPXDI1, -BPXSY2, -BPXDI2, -BPXSY3, -BPXDI3, -BPXSY4, -BPXDI4, -WTSAF2YR, -WTSAFPRP, -starts_with("ALQ"), -DID060, -DIQ060U, -starts_with("SMQ"), -SMD030, -SMD055, -SMD057, -'NA' ) 
+
+
+ #63328 * 78
+```
+
+# convert 7/77/777/7777/77777(Refused) and 9/99/999/9999/99999 (Don't know) to NA
+```{r}
+all2 <- all2 %>% 
+  mutate(education = ifelse(education %in% c(7,9), NA, education),
+         birthcountry = ifelse(birthcountry %in% c(7,77,  9, 99), NA, birthcountry),
+         ridreth3 = ifelse(ridreth3 == 7, 5, ridreth3),
+         income = ifelse(income %in% c(77, 99), NA, income),
+         DM.doc = ifelse(DM.doc %in% c(7,9), NA, DM.doc),
+         DM.age = ifelse(birthcountry %in% c(777, 7777, 77777, 999, 9999, 99999), NA, DM.age),
+         DM.insulin = ifelse(DM.insulin %in% c(7,9), NA, DM.insulin),
+         DM.pills = ifelse(DM.pills %in% c(7,9), NA, DM.pills),
+         RXDUSE = ifelse(RXDUSE %in% c(7,9), NA, RXDUSE),
+         DM.retinopathy = ifelse(DM.retinopathy %in% c(7,9), NA, DM.retinopathy))
+
+saveRDS(all2, "D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Cleaned data//all2.rds")
+all2 = readRDS("D://University of Michigan Dropbox//Hu Miaojin//NHANES diabetes//Cleaned data//all2.rds")
+```
+
+
+# add some additional vars
+```{r}
+all2 <- all2 %>% 
+  inner_join(BPQ_combined, by = "SEQN") %>% 
+  mutate(BPQ020 = ifelse(BPQ020 %in% c(7,9), NA, BPQ020) )
+```
+
+
+#check
+#```{r}
+all2_12 <- all2 %>% 
+  filter(cycle==12) 
+na_columns <- sapply(all2_12, function(col) all(is.na(col)))
+na_columns <- names(all2_12)[na_columns]
+na_columns
+  
+```
